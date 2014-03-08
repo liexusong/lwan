@@ -241,6 +241,8 @@ _thread_io_loop(void *data)
     const unsigned short keep_alive_timeout = t->lwan->config.keep_alive_timeout;
     const int max_events = min((int)t->lwan->thread.max_fd, 1024);
 
+    coro_switcher_init(&switcher);
+
     lwan_status_debug("Starting IO loop on thread #%d", t->id + 1);
 
     events = calloc((size_t)max_events, sizeof(*events));
@@ -295,6 +297,7 @@ _thread_io_loop(void *data)
 
 epoll_fd_closed:
     _death_queue_shutdown(&dq);
+    coro_switcher_shutdown(&switcher);
     free(events);
 
     return NULL;

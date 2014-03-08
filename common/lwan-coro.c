@@ -122,7 +122,7 @@ _coro_run_deferred(coro_t *coro)
         coro_defer_t *tmp = defer;
         defer->func(defer->data1, defer->data2);
         defer = tmp->next;
-        free(tmp);
+        lwan_mempool_release(coro->switcher->defer_pool, tmp);
     }
     coro->defer = NULL;
 }
@@ -157,7 +157,7 @@ coro_reset(coro_t *coro, coro_function_t func, void *data)
 ALWAYS_INLINE coro_t *
 coro_new(coro_switcher_t *switcher, coro_function_t function, void *data)
 {
-    coro_t *coro = malloc(sizeof(*coro) + CORO_STACK_MIN);
+    coro_t *coro = lwan_mempool_acquire(switcher->coro_pool);
     if (!coro)
         return NULL;
 
@@ -222,13 +222,13 @@ coro_free(coro_t *coro)
     VALGRIND_STACK_DEREGISTER(coro->vg_stack_id);
 #endif
     _coro_run_deferred(coro);
-    free(coro);
+    lwan_mempool_release(coro->switcher->coro_pool, coro);
 }
 
 static void
 _coro_defer_any(coro_t *coro, void (*func)(), void *data1, void *data2)
 {
-    coro_defer_t *defer = malloc(sizeof(*defer));
+    coro_defer_t *defer = lwan_mempool_acquire(coro->switcher->defer_pool);
     if (UNLIKELY(!defer))
         return;
 
@@ -288,4 +288,23 @@ coro_printf(coro_t *coro, const char *fmt, ...)
 
     coro_defer(coro, CORO_DEFER(free), tmp_str);
     return tmp_str;
+}
+
+void
+coro_switcher_init(coro_switcher_t *switcher)
+{
+    switcher->coro_pool = lwan_mempool_new(sizeof(coro_t) + CORO_STACK_MIN);
+    if (UNLIKELY(!switcher->coro_pool))
+        lwan_status_critical_perror("lwan_mempool_new");
+
+    switcher->defer_pool = lwan_mempool_new(sizeof(coro_defer_t));
+    if (UNLIKELY(!switcher->defer_pool))
+        lwan_status_critical_perror("lwan_mempool_new");
+}
+
+void
+coro_switcher_shutdown(coro_switcher_t *switcher)
+{
+    lwan_mempool_free(switcher->coro_pool);
+    lwan_mempool_free(switcher->defer_pool);
 }

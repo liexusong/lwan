@@ -512,3 +512,63 @@ lwan_main_loop(lwan_t *l)
         _push_request_fd(l, child_fd);
     }
 }
+
+
+struct lwan_mempool_block_t {
+    struct lwan_mempool_block_t *next;
+};
+struct lwan_mempool_t_ {
+    size_t block_size;
+    size_t items;
+    size_t max_items;
+    struct lwan_mempool_block_t *blocks;
+};
+
+lwan_mempool_t *lwan_mempool_new(size_t block_size)
+{
+    lwan_mempool_t *pool = malloc(sizeof(*pool));
+    if (!pool)
+        return NULL;
+    pool->block_size = block_size;
+    pool->items = 0;
+    pool->max_items = 500;
+    pool->blocks = NULL;
+    return pool;
+}
+
+void* lwan_mempool_acquire(lwan_mempool_t *pool)
+{
+    if (pool->blocks) {
+        struct lwan_mempool_block_t *first = pool->blocks;
+        pool->blocks = pool->blocks->next;
+        return first + 1;
+    }
+
+    pool->items++;
+    return malloc(pool->block_size + sizeof(struct lwan_mempool_block_t*));
+}
+
+void lwan_mempool_release(lwan_mempool_t *pool, void *ptr)
+{
+    if (pool->items > pool->max_items) {
+        free(ptr);
+        return;
+    }
+
+    struct lwan_mempool_block_t *block = ptr;
+    block--;
+
+    block->next = pool->blocks;
+    pool->blocks = block;
+    pool->items--;
+}
+
+void lwan_mempool_free(lwan_mempool_t *pool)
+{
+    while (pool->blocks) {
+        struct lwan_mempool_block_t *tmp = pool->blocks->next;
+        free(pool->blocks);
+        pool->blocks = tmp;
+    }
+    free(pool);
+}
