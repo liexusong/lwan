@@ -1,6 +1,6 @@
 /*
  * lwan - simple web server
- * Copyright (c) 2012 Leandro A. F. Pereira <leandro@hardinfo.org>
+ * Copyright (c) 2014 Leandro A. F. Pereira <leandro@hardinfo.org>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -17,27 +17,22 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#ifndef __LWAN_SERVE_FILES_H__
-#define __LWAN_SERVE_FILES_H__
+#ifndef __LWAN_REDIRECT_H__
+#define __LWAN_REDIRECT_H__
 
 #include "lwan.h"
 
-struct lwan_serve_files_settings_t {
-  char *root_path;
-  char *index_html;
+struct lwan_redirect_settings_t {
+  char *to;
 };
 
-#define SERVE_FILES_SETTINGS(root_path_, index_html_) \
-  .module = lwan_module_serve_files(), \
-  .args = ((struct lwan_serve_files_settings_t[]) {{ \
-    .root_path = root_path_, \
-    .index_html = index_html_ \
+#define REDIRECT(to_) \
+  .module = lwan_module_redirect(), \
+  .args = ((struct lwan_redirect_t[]) {{ \
+    .to = to_ \
   }}), \
   .flags = 0
 
-#define SERVE_FILES(root_path) \
-  SERVE_FILES_SETTINGS(root_path, NULL)
+const lwan_module_t *lwan_module_redirect(void);
 
-const lwan_module_t *lwan_module_serve_files(void);
-
-#endif /* __LWAN_SERVE_FILES_H__ */
+#endif /* __LWAN_REDIRECT_H__ */

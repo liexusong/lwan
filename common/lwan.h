@@ -34,12 +34,8 @@
 #define DEFAULT_BUFFER_SIZE 4096
 #define DEFAULT_HEADERS_SIZE 512
 
-#define ASSERT_NOT_REACHED()  assert(!"Not reached")
-#define ASSERT_NOT_REACHED_RETURN(...) \
-    do { \
-        ASSERT_NOT_REACHED(); \
-        return (__VA_ARGS__); \
-    } while(0)
+#undef static_assert
+#define static_assert(expr, msg)	_Static_assert((expr), msg)
 
 #define N_ELEMENTS(array) (sizeof(array) / sizeof(array[0]))
 
@@ -78,7 +74,7 @@
 #define ATOMIC_BITWISE(P, O, V) (__sync_##O##_and_fetch((P), (V)))
 
 typedef struct lwan_t_			lwan_t;
-typedef struct lwan_handler_t_		lwan_handler_t;
+typedef struct lwan_module_t_		lwan_module_t;
 typedef struct lwan_key_value_t_	lwan_key_value_t;
 typedef struct lwan_request_t_		lwan_request_t;
 typedef struct lwan_response_t_		lwan_response_t;
@@ -95,9 +91,10 @@ typedef enum {
     HTTP_NOT_MODIFIED = 304,
     HTTP_BAD_REQUEST = 400,
     HTTP_NOT_AUTHORIZED = 401,
-    HTTP_NOT_FOUND = 404,
     HTTP_FORBIDDEN = 403,
+    HTTP_NOT_FOUND = 404,
     HTTP_NOT_ALLOWED = 405,
+    HTTP_TIMEOUT = 408,
     HTTP_TOO_LARGE = 413,
     HTTP_RANGE_UNSATISFIABLE = 416,
     HTTP_INTERNAL_ERROR = 500,
@@ -111,6 +108,7 @@ typedef enum {
     HANDLER_PARSE_ACCEPT_ENCODING = 1<<3,
     HANDLER_PARSE_POST_DATA = 1<<4,
     HANDLER_MUST_AUTHORIZE = 1<<5,
+    HANDLER_REMOVE_LEADING_SLASH = 1<<6,
 
     HANDLER_PARSE_MASK = 1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4
 } lwan_handler_flags_t;
@@ -170,7 +168,7 @@ struct lwan_connection_t_ {
     unsigned int time_to_die;
     coro_t *coro;
     lwan_thread_t *thread;
-    strbuf_t *response_buffer; /* Leaky abstraction */
+    int prev, next; /* for death queue */
 };
 
 struct lwan_request_t_ {
@@ -194,7 +192,16 @@ struct lwan_request_t_ {
     lwan_response_t response;
 };
 
-struct lwan_handler_t_ {
+// 模块对象
+// @name: 模块名称
+// @init: 初始化模块时调用
+// @init_from_hash: 添加到HashTable时被调用
+// @shutdown: 被注销时调用
+// @handle: 模块的处理回调
+// @flags: 模块的标志
+//
+struct lwan_module_t_ {
+    const char *name;
     void *(*init)(void *args);
     void *(*init_from_hash)(const struct hash *hash);
     void (*shutdown)(void *data);
@@ -203,14 +210,14 @@ struct lwan_handler_t_ {
 };
 
 struct lwan_url_map_t_ {
-    lwan_http_status_t (*callback)(lwan_request_t *request, lwan_response_t *response, void *data);
+    lwan_http_status_t (*handler)(lwan_request_t *request, lwan_response_t *response, void *data);
     void *data;
 
     char *prefix;
     size_t prefix_len;
     lwan_handler_flags_t flags;
 
-    lwan_handler_t *handler;
+    const lwan_module_t *module;
     void *args;
 
     struct {
@@ -230,10 +237,11 @@ struct lwan_thread_t_ {
 
     pthread_t self;
     int epoll_fd;
+    int socketpair[2];
 };
 
 struct lwan_config_t_ {
-    uint16_t port;
+    char *listener;
     unsigned short keep_alive_timeout;
     bool quiet;
     bool reuse_port;
@@ -252,6 +260,8 @@ struct lwan_t_ {
         unsigned max_fd;
         lwan_thread_t *threads;
     } thread;
+
+    struct hash *module_registry;
 };
 
 void lwan_set_url_map(lwan_t *l, const lwan_url_map_t *map);
@@ -259,11 +269,15 @@ void lwan_main_loop(lwan_t *l);
 
 void lwan_response(lwan_request_t *request, lwan_http_status_t status);
 void lwan_default_response(lwan_request_t *request, lwan_http_status_t status);
-size_t lwan_prepare_response_header(lwan_request_t *request, lwan_http_status_t status, char header_buffer[], size_t header_buffer_size);
+size_t lwan_prepare_response_header(lwan_request_t *request, lwan_http_status_t status, char header_buffer[], size_t header_buffer_size)
+    __attribute__((warn_unused_result));
 
-const char *lwan_request_get_post_param(lwan_request_t *request, const char *key);
-const char *lwan_request_get_query_param(lwan_request_t *request, const char *key);
-const char *lwan_request_get_remote_address(lwan_request_t *request, char *buffer);
+const char *lwan_request_get_post_param(lwan_request_t *request, const char *key)
+    __attribute__((warn_unused_result));
+const char *lwan_request_get_query_param(lwan_request_t *request, const char *key)
+    __attribute__((warn_unused_result));
+const char *lwan_request_get_remote_address(lwan_request_t *request, char buffer[static INET6_ADDRSTRLEN])
+    __attribute__((warn_unused_result));
 void lwan_process_request(lwan_t *l, lwan_request_t *request);
 
 bool lwan_response_set_chunked(lwan_request_t *request, lwan_http_status_t status);
@@ -272,15 +286,21 @@ void lwan_response_send_chunk(lwan_request_t *request);
 bool lwan_response_set_event_stream(lwan_request_t *request, lwan_http_status_t status);
 void lwan_response_send_event(lwan_request_t *request, const char *event);
 
-void lwan_format_rfc_time(time_t t, char buffer[static 31]);
+void lwan_format_rfc_time(time_t t, char buffer[static 30]);
 
-const char *lwan_http_status_as_string(lwan_http_status_t status) __attribute__((pure));
-const char *lwan_http_status_as_descriptive_string(lwan_http_status_t status) __attribute__((pure));
-const char *lwan_determine_mime_type_for_file_name(const char *file_name) __attribute__((pure));
+const char *lwan_http_status_as_string(lwan_http_status_t status)
+    __attribute__((pure)) __attribute__((warn_unused_result));
+const char *lwan_http_status_as_string_with_code(lwan_http_status_t status)
+    __attribute__((pure)) __attribute__((warn_unused_result));
+const char *lwan_http_status_as_descriptive_string(lwan_http_status_t status)
+    __attribute__((pure)) __attribute__((warn_unused_result));
+const char *lwan_determine_mime_type_for_file_name(const char *file_name)
+    __attribute__((pure)) __attribute__((warn_unused_result));
 
 void lwan_init(lwan_t *l);
 void lwan_shutdown(lwan_t *l);
 
-int lwan_connection_get_fd(lwan_connection_t *conn) __attribute__((pure));
+int lwan_connection_get_fd(lwan_connection_t *conn)
+    __attribute__((pure)) __attribute__((warn_unused_result));
 
 #endif /* __LWAN_H__ */

@@ -34,6 +34,16 @@ struct realm_password_file_t {
 
 static struct cache_t *realm_password_cache = NULL;
 
+static void fourty_two_and_free(void *str)
+{
+    if (LIKELY(str)) {
+        char *s = str;
+        while (*s)
+            *s++ = 42;
+        free(str);
+    }
+}
+
 static struct cache_entry_t *_create_realm_file(
           const char *key,
           void *context __attribute__((unused)))
@@ -45,44 +55,42 @@ static struct cache_entry_t *_create_realm_file(
     if (UNLIKELY(!rpf))
         return NULL;
 
-    rpf->entries = hash_str_new(free, free);
+    rpf->entries = hash_str_new(fourty_two_and_free, fourty_two_and_free);
     if (UNLIKELY(!rpf->entries))
-        goto error;
+        goto error_no_close;
 
     if (!config_open(&f, key))
-        goto error;
+        goto error_no_close;
 
     while (config_read_line(&f, &l)) {
         /* FIXME: Storing plain-text passwords in memory isn't a good idea. */
         switch (l.type) {
         case CONFIG_LINE_TYPE_LINE: {
             char *username = strdup(l.line.key);
+            if (!username)
+                goto error;
+
             char *password = strdup(l.line.value);
-            int err;
-
-            if (!username || !password) {
+            if (!password) {
                 free(username);
-                free(password);
-                config_close(&f);
                 goto error;
             }
 
-            err = hash_add_unique(rpf->entries, username, password);
-            if (err) {
-                free(username);
-                free(password);
+            int err = hash_add_unique(rpf->entries, username, password);
+            if (LIKELY(!err))
+                continue;
 
-                if (err == -EEXIST) {
-                    lwan_status_warning(
-                        "Username entry already exists, ignoring: \"%s\"",
-                        username);
-                    continue;
-                }
+            free(username);
+            free(password);
 
-                config_close(&f);
-                goto error;
+            if (err == -EEXIST) {
+                lwan_status_warning(
+                    "Username entry already exists, ignoring: \"%s\"",
+                    l.line.key);
+                continue;
             }
-            break;
+
+            goto error;
         }
         default:
             config_error(&f, "Expected username = password");
@@ -93,7 +101,6 @@ static struct cache_entry_t *_create_realm_file(
     if (f.error_message) {
         lwan_status_error("Error on password file \"%s\", line %d: %s",
               key, f.line, f.error_message);
-        config_close(&f);
         goto error;
     }
 
@@ -101,12 +108,14 @@ static struct cache_entry_t *_create_realm_file(
     return (struct cache_entry_t *)rpf;
 
 error:
+    config_close(&f);
+error_no_close:
     hash_free(rpf->entries);
     free(rpf);
     return NULL;
 }
 
-static void _destroy_realm_file(struct cache_entry_t *entry,
+static void destroy_realm_file(struct cache_entry_t *entry,
                                 void *context __attribute__((unused)))
 {
     struct realm_password_file_t *rpf = (struct realm_password_file_t *)entry;
@@ -118,7 +127,7 @@ bool
 lwan_http_authorize_init(void)
 {
     realm_password_cache = cache_create(_create_realm_file,
-          _destroy_realm_file, NULL, 60);
+          destroy_realm_file, NULL, 60);
 
     return !!realm_password_cache;
 }
@@ -130,7 +139,7 @@ lwan_http_authorize_shutdown(void)
 }
 
 static bool
-_authorize(coro_t *coro,
+authorize(coro_t *coro,
            lwan_value_t *authorization,
            const char *password_file)
 {
@@ -152,11 +161,10 @@ _authorize(coro_t *coro,
     if (UNLIKELY(!decoded))
         return false;
 
-    /* 1024 is the line buffer size for config_* */
-    if (UNLIKELY(decoded_len >= 1024))
+    if (UNLIKELY(decoded_len >= sizeof(((config_line_t *)0)->buffer)))
         goto out;
 
-    colon = strchr((char *)decoded, ':');
+    colon = memchr(decoded, ':', decoded_len);
     if (UNLIKELY(!colon))
         goto out;
 
@@ -191,7 +199,7 @@ lwan_http_authorize(lwan_request_t *request,
     authorization->value += basic_len;
     authorization->len -= basic_len;
 
-    if (_authorize(request->conn->coro, authorization, password_file))
+    if (authorize(request->conn->coro, authorization, password_file))
         return true;
 
 unauthorized:

@@ -19,10 +19,13 @@
 #else                /*  */
 #define FORCE_INLINE
 #endif                /*  */
+
+#ifndef __x86_64__
 static FORCE_INLINE uint32_t rotl32(uint32_t x, int8_t r)
 {
     return (x << r) | (x >> (32 - r));
 }
+#endif
 
 static FORCE_INLINE uint64_t rotl64(uint64_t x, int8_t r)
 {
@@ -42,6 +45,7 @@ static FORCE_INLINE uint64_t rotl64(uint64_t x, int8_t r)
 
 //-----------------------------------------------------------------------------
 // Finalization mix - force all bits of a hash block to avalanche
+#ifndef __x86_64__
 static FORCE_INLINE uint32_t fmix32(uint32_t h)
 {
     h ^= h >> 16;
@@ -51,7 +55,7 @@ static FORCE_INLINE uint32_t fmix32(uint32_t h)
     h ^= h >> 16;
     return h;
 }
-
+#endif
 
 //----------
 static FORCE_INLINE uint64_t fmix64(uint64_t k)
@@ -66,12 +70,13 @@ static FORCE_INLINE uint64_t fmix64(uint64_t k)
 
 
 //-----------------------------------------------------------------------------
+#ifndef __x86_64__
 FORCE_INLINE static void
-MurmurHash3_x86_32(const void *key, int len, uint32_t seed, void *out)
+MurmurHash3_x86_32(const void *key, size_t len, uint32_t seed, void *out)
 {
     const uint8_t *data = (const uint8_t *)key;
-    const int nblocks = len / 4;
-    int i;
+    const size_t nblocks = len / 4;
+    size_t i;
     uint32_t h1 = seed;
     uint32_t c1 = 0xcc9e2d51;
     uint32_t c2 = 0x1b873593;
@@ -115,12 +120,12 @@ MurmurHash3_x86_32(const void *key, int len, uint32_t seed, void *out)
 
 
 //-----------------------------------------------------------------------------
-FORCE_INLINE static void MurmurHash3_x86_128 (const void *key, const int len,
+FORCE_INLINE static void MurmurHash3_x86_128 (const void *key, const size_t len,
                                               uint32_t seed, void *out)
 {
-    int i;
+    size_t i;
     const uint8_t * data = (const uint8_t*)key;
-    const int nblocks = len / 16;
+    const size_t nblocks = len / 16;
 
     uint32_t h1 = seed;
     uint32_t h2 = seed;
@@ -210,6 +215,7 @@ FORCE_INLINE static void MurmurHash3_x86_128 (const void *key, const int len,
     ((uint32_t*)out)[2] = h3;
     ((uint32_t*)out)[3] = h4;
 }
+#endif
 
 //-----------------------------------------------------------------------------
 FORCE_INLINE static void

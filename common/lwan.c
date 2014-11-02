@@ -21,22 +21,21 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <limits.h>
-#include <setjmp.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "lwan.h"
 #include "lwan-private.h"
 #include "lwan-config.h"
 #include "lwan-serve-files.h"
+#include "lwan-redirect.h"
 #include "lwan-http-authorize.h"
 #include "hash.h"
-
-static jmp_buf cleanup_jmp_buf;
 
 #define ONE_MINUTE 60
 #define ONE_HOUR (ONE_MINUTE * 60)
@@ -46,33 +45,59 @@ static jmp_buf cleanup_jmp_buf;
 #define ONE_YEAR (ONE_MONTH * 12)
 
 static const lwan_config_t default_config = {
-    .port = 8080,
+    .listener = "localhost:8080",
     .keep_alive_timeout = 15,
     .quiet = false,
     .reuse_port = false,
     .expires = 1 * ONE_WEEK
 };
 
-static void *find_symbol(const char *name)
+static void lwan_module_init(lwan_t *l)
 {
-    /* FIXME: This is pretty ugly. Find a better way of doing this. */
+    if (!l->module_registry) {
+        lwan_status_debug("Initializing module registry");
+        l->module_registry = hash_str_new(NULL, NULL);
+    }
+}
+
+static void lwan_module_shutdown(lwan_t *l)
+{
+    hash_free(l->module_registry);
+}
+
+static void lwan_module_register(lwan_t *l, const lwan_module_t *module)
+{
+    if (!module->name)
+        lwan_status_critical("Module at %p has no name", module);
+
+    lwan_status_debug("Registering module \"%s\"", module->name);
+    hash_add(l->module_registry, module->name, module);
+}
+
+static const lwan_module_t *lwan_module_find(lwan_t *l, const char *name)
+{
+    return hash_find(l->module_registry, name);
+}
+
+static void *find_handler_symbol(const char *name)
+{
     void *symbol = dlsym(RTLD_NEXT, name);
     if (!symbol)
         symbol = dlsym(RTLD_DEFAULT, name);
-    if (!symbol) {
-        if (!strcmp(name, "serve_files"))
-            symbol = &serve_files;
-    }
     return symbol;
 }
 
 static void destroy_urlmap(void *data)
 {
     lwan_url_map_t *url_map = data;
-    lwan_handler_t *handler = url_map->handler;
 
-    if (handler && handler->shutdown)
-        handler->shutdown(url_map->data);
+    if (url_map->module) {
+        const lwan_module_t *module = url_map->module;
+        if (module->shutdown)
+            module->shutdown(url_map->data);
+    } else if (url_map->data) {
+        hash_free(url_map->data);
+    }
 
     free(url_map->authorization.realm);
     free(url_map->authorization.password_file);
@@ -84,10 +109,8 @@ static lwan_url_map_t *add_url_map(lwan_trie_t *t, const char *prefix, const lwa
 {
     lwan_url_map_t *copy = malloc(sizeof(*copy));
 
-    if (!copy) {
-        lwan_status_perror("Could not copy URL map");
-        ASSERT_NOT_REACHED_RETURN(NULL);
-    }
+    if (!copy)
+        lwan_status_critical_perror("Could not copy URL map");
 
     memcpy(copy, map, sizeof(*copy));
 
@@ -143,27 +166,31 @@ error:
     free(url_map->authorization.password_file);
 }
 
-static void parse_listener_prefix(config_t *c, config_line_t *l, lwan_t *lwan)
+static void parse_listener_prefix(config_t *c, config_line_t *l, lwan_t *lwan,
+    const lwan_module_t *module)
 {
     lwan_url_map_t url_map = {0};
     struct hash *hash = hash_str_new(free, free);
-    lwan_handler_t *handler = NULL;
-    void *callback = NULL;
+    void *handler = NULL;
     char *prefix = strdupa(l->line.value);
 
     while (config_read_line(c, l)) {
       switch (l->type) {
       case CONFIG_LINE_TYPE_LINE:
-          if (!strcmp(l->line.key, "handler")) {
-              handler = find_symbol(l->line.value);
-              if (!handler) {
-                  config_error(c, "Could not find handler \"%s\"", l->line.value);
+          if (!strcmp(l->line.key, "module")) {
+              if (module) {
+                  config_error(c, "Module already specified");
                   goto out;
               }
-          } else if (!strcmp(l->line.key, "callback")) {
-              callback = find_symbol(l->line.value);
-              if (!callback) {
-                  config_error(c, "Could not find callback \"%s\"", l->line.value);
+              module = lwan_module_find(lwan, l->line.value);
+              if (!module) {
+                  config_error(c, "Could not find module \"%s\"", l->line.value);
+                  goto out;
+              }
+          } else if (!strcmp(l->line.key, "handler")) {
+              handler = find_handler_symbol(l->line.value);
+              if (!handler) {
+                  config_error(c, "Could not find handler \"%s\"", l->line.value);
                   goto out;
               }
           } else {
@@ -189,25 +216,27 @@ static void parse_listener_prefix(config_t *c, config_line_t *l, lwan_t *lwan)
     goto out;
 
 add_map:
-    if (handler == callback && !callback) {
-        config_error(c, "Missing callback or handler");
+    if (module == handler && !handler) {
+        config_error(c, "Missing module or handler");
         goto out;
     }
-    if (handler && callback) {
-        config_error(c, "Callback and handler are mutually exclusive");
+    if (module && handler) {
+        config_error(c, "Handler and module are mutually exclusive");
         goto out;
     }
 
-    if (callback) {
-        url_map.callback = callback;
-        url_map.flags |= HANDLER_PARSE_MASK;
-        url_map.data = NULL;
-        url_map.handler = NULL;
-    } else if (handler && handler->init_from_hash && handler->handle) {
-        url_map.data = handler->init_from_hash(hash);
-        url_map.callback = handler->handle;
-        url_map.flags |= handler->flags;
+    if (handler) {
         url_map.handler = handler;
+        url_map.flags |= HANDLER_PARSE_MASK;
+        url_map.data = hash;
+        url_map.module = NULL;
+
+        hash = NULL;
+    } else if (module && module->init_from_hash && module->handle) {
+        url_map.data = module->init_from_hash(hash);
+        url_map.handler = module->handle;
+        url_map.flags |= module->flags;
+        url_map.module = module;
     } else {
         config_error(c, "Invalid handler");
         goto out;
@@ -230,10 +259,10 @@ void lwan_set_url_map(lwan_t *l, const lwan_url_map_t *map)
         if (UNLIKELY(!copy))
             continue;
 
-        if (copy->handler && copy->handler->init) {
-            copy->data = copy->handler->init(copy->args);
-            copy->flags = copy->handler->flags;
-            copy->callback = copy->handler->handle;
+        if (copy->module && copy->module->init) {
+            copy->data = copy->module->init(copy->args);
+            copy->flags = copy->module->flags;
+            copy->handler = copy->module->handle;
         } else {
             copy->flags = HANDLER_PARSE_MASK;
         }
@@ -242,7 +271,7 @@ void lwan_set_url_map(lwan_t *l, const lwan_url_map_t *map)
 
 static void parse_listener(config_t *c, config_line_t *l, lwan_t *lwan)
 {
-    lwan->config.port = (uint16_t)parse_long(l->section.param, 8080);
+    lwan->config.listener = strdup(l->section.param);
 
     while (config_read_line(c, l)) {
         switch (l->type) {
@@ -250,10 +279,17 @@ static void parse_listener(config_t *c, config_line_t *l, lwan_t *lwan)
             config_error(c, "Expecting prefix section");
             return;
         case CONFIG_LINE_TYPE_SECTION:
-            if (!strcmp(l->section.name, "prefix"))
-                parse_listener_prefix(c, l, lwan);
-            else
-                config_error(c, "Unknown section type: %s", l->section.name);
+            if (!strcmp(l->section.name, "prefix")) {
+                parse_listener_prefix(c, l, lwan, NULL);
+            } else {
+                const lwan_module_t *module = lwan_module_find(lwan, l->section.name);
+                if (!module) {
+                    config_error(c, "Invalid section name or module not found: %s",
+                        l->section.name);
+                } else {
+                    parse_listener_prefix(c, l, lwan, module);
+                }
+            }
             break;
         case CONFIG_LINE_TYPE_SECTION_END:
             return;
@@ -286,13 +322,13 @@ out:
     return "lwan.conf";
 }
 
-static unsigned int _parse_expires(const char *str, unsigned int default_value)
+static unsigned int parse_expires(const char *str, unsigned int default_value)
 {
     unsigned int total = 0;
     unsigned int period;
     char multiplier;
 
-    while (*str && sscanf(str, "%d%c", &period, &multiplier) == 2) {
+    while (*str && sscanf(str, "%u%c", &period, &multiplier) == 2) {
         switch (multiplier) {
         case 's': total += period; break;
         case 'm': total += period * ONE_MINUTE; break;
@@ -306,7 +342,7 @@ static unsigned int _parse_expires(const char *str, unsigned int default_value)
                         multiplier);
         }
 
-        str = rawmemchr(str, multiplier) + 1;
+        str = (const char *)rawmemchr(str, multiplier) + 1;
     }
 
     return total ? total : default_value;
@@ -341,7 +377,7 @@ static bool setup_from_config(lwan_t *lwan)
                 lwan->config.reuse_port = parse_bool(line.line.value,
                             default_config.reuse_port);
             else if (!strcmp(line.line.key, "expires"))
-                lwan->config.expires = _parse_expires(line.line.value,
+                lwan->config.expires = parse_expires(line.line.value,
                             default_config.expires);
             else
                 config_error(&conf, "Unknown config key: %s", line.line.key);
@@ -372,13 +408,49 @@ static bool setup_from_config(lwan_t *lwan)
     return true;
 }
 
+static rlim_t
+setup_open_file_count_limits(void)
+{
+    struct rlimit r;
+
+    if (getrlimit(RLIMIT_NOFILE, &r) < 0)
+        lwan_status_critical_perror("getrlimit");
+
+    if (r.rlim_max == RLIM_INFINITY)
+        r.rlim_cur *= 8;
+    else if (r.rlim_cur < r.rlim_max)
+        r.rlim_cur = r.rlim_max;
+
+    if (setrlimit(RLIMIT_NOFILE, &r) < 0)
+        lwan_status_critical_perror("setrlimit");
+
+    return r.rlim_cur;
+}
+
+static void
+allocate_connections(lwan_t *l, size_t max_open_files)
+{
+    l->conns = calloc(max_open_files, sizeof(lwan_connection_t));
+    if (!l->conns)
+        lwan_status_critical_perror("calloc");
+}
+
+static short
+get_number_of_cpus(void)
+{
+    long n_online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (UNLIKELY(n_online_cpus < 0)) {
+        lwan_status_warning("Could not get number of online CPUs, assuming 1 CPU.");
+        return 1;
+    }
+    return (short)n_online_cpus;
+}
+
 void
 lwan_init(lwan_t *l)
 {
-    long max_threads = sysconf(_SC_NPROCESSORS_ONLN);
-    struct rlimit r;
-
     /* Load defaults */
+    memset(l, 0, sizeof(*l));
     memcpy(&l->config, &default_config, sizeof(default_config));
 
     /* Initialize status first, as it is used by other things during
@@ -388,9 +460,14 @@ lwan_init(lwan_t *l)
     /* These will only print debugging messages. Debug messages are always
      * printed if we're on a debug build, so the quiet setting will be
      * respected. */
-    lwan_job_thread_init();
+    lwan_job_thread_init(); // 初始化任务线程
     lwan_response_init();
     lwan_tables_init();
+
+    // 初始化模块
+    lwan_module_init(l);
+    lwan_module_register(l, lwan_module_serve_files());
+    lwan_module_register(l, lwan_module_redirect());
 
     /* Load the configuration file. */
     if (!setup_from_config(l))
@@ -399,32 +476,22 @@ lwan_init(lwan_t *l)
     /* Continue initialization as normal. */
     lwan_status_debug("Initializing lwan web server");
 
-    l->thread.count = (short)(max_threads > 0 ? max_threads : 2);
+    l->thread.count = get_number_of_cpus(); // 获取电脑CPU数
+    if (l->thread.count == 1)
+        l->thread.count = 2;
 
-    if (getrlimit(RLIMIT_NOFILE, &r) < 0)
-        lwan_status_critical_perror("getrlimit");
+    rlim_t max_open_files = setup_open_file_count_limits(); // 获取电脑最大能够打开的文件数
+    allocate_connections(l, (size_t)max_open_files); // 申请用户连接对象
 
-    if (r.rlim_max == RLIM_INFINITY)
-        r.rlim_cur *= 8;
-    else if (r.rlim_cur < r.rlim_max)
-        r.rlim_cur = r.rlim_max;
-    if (setrlimit(RLIMIT_NOFILE, &r) < 0)
-        lwan_status_critical_perror("setrlimit");
-
-    l->conns = calloc(r.rlim_cur, sizeof(lwan_connection_t));
-    l->thread.max_fd = (unsigned)r.rlim_cur / (unsigned)l->thread.count;
+    l->thread.max_fd = (unsigned)max_open_files / (unsigned)l->thread.count;
     lwan_status_info("Using %d threads, maximum %d sockets per thread",
         l->thread.count, l->thread.max_fd);
 
-    for (--r.rlim_cur; r.rlim_cur; --r.rlim_cur)
-        l->conns[r.rlim_cur].response_buffer = strbuf_new();
-
-    srand((unsigned)time(NULL));
     signal(SIGPIPE, SIG_IGN);
     close(STDIN_FILENO);
 
-    lwan_thread_init(l);
-    lwan_socket_init(l);
+    lwan_thread_init(l); // 初始化工作线程
+    lwan_socket_init(l); // 初始化服务端socket
     lwan_http_authorize_init();
 }
 
@@ -433,16 +500,14 @@ lwan_shutdown(lwan_t *l)
 {
     lwan_status_info("Shutting down");
 
+    if (l->config.listener != default_config.listener)
+        free(l->config.listener);
+
     lwan_job_thread_shutdown();
     lwan_thread_shutdown(l);
-    lwan_socket_shutdown(l);
 
     lwan_status_debug("Shutting down URL handlers");
     lwan_trie_destroy(l->url_map_trie);
-
-    unsigned i;
-    for (i = l->thread.max_fd * (unsigned)l->thread.count - 1; i != 0; --i)
-        strbuf_free(l->conns[i].response_buffer);
 
     free(l->conns);
 
@@ -450,14 +515,16 @@ lwan_shutdown(lwan_t *l)
     lwan_tables_shutdown();
     lwan_status_shutdown(l);
     lwan_http_authorize_shutdown();
+    lwan_module_shutdown(l);
 }
 
 static ALWAYS_INLINE void
-_push_request_fd(lwan_t *l, int fd)
+schedule_client(lwan_t *l, int fd)
 {
     int thread;
 #ifdef __x86_64__
-    assert(sizeof(lwan_connection_t) == 32);
+    static_assert(sizeof(lwan_connection_t) == 32,
+                                        "Two connections per cache line");
     /* Since lwan_connection_t is guaranteed to be 32-byte long, two of them
      * can fill up a cache line.  This formula will group two connections
      * per thread in a way that false-sharing is avoided.  This gives wrong
@@ -469,45 +536,48 @@ _push_request_fd(lwan_t *l, int fd)
     static int counter = 0;
     thread = counter++ % l->thread.count;
 #endif
-    int epoll_fd = l->thread.threads[thread].epoll_fd;
-
-    struct epoll_event event = {
-        .events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET,
-        .data.ptr = &l->conns[fd]
-    };
-
-    l->conns[fd].flags = 0;
-    l->conns[fd].thread = &l->thread.threads[thread];
-
-    if (UNLIKELY(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0))
-        lwan_status_critical_perror("epoll_ctl");
+    lwan_thread_t *t = &l->thread.threads[thread];
+    lwan_thread_add_client(t, fd);
 }
 
+static volatile sig_atomic_t main_socket = -1;
+
 static void
-_signal_handler(int signal_number)
+sigint_handler(int signal_number __attribute__((unused)))
 {
-    lwan_status_info("Signal %d (%s) received",
-                                signal_number, strsignal(signal_number));
-    longjmp(cleanup_jmp_buf, 1);
+    if (main_socket < 0)
+        return;
+    close(main_socket);
+    main_socket = -1;
 }
 
 void
 lwan_main_loop(lwan_t *l)
 {
-    if (setjmp(cleanup_jmp_buf))
-        return;
-
-    signal(SIGINT, _signal_handler);
+    assert(main_socket == -1);
+    main_socket = l->main_socket;
+    if (signal(SIGINT, sigint_handler) == SIG_ERR)
+        lwan_status_critical("Could not set signal handler");
 
     lwan_status_info("Ready to serve");
 
     for (;;) {
-        int child_fd = accept4(l->main_socket, NULL, NULL, SOCK_NONBLOCK);
-        if (UNLIKELY(child_fd < 0)) {
-            lwan_status_perror("accept");
-            continue;
+        int client_fd = accept4(l->main_socket, NULL, NULL, SOCK_NONBLOCK);
+        if (UNLIKELY(client_fd < 0)) {
+            if (errno != EBADF) {
+                lwan_status_perror("accept");
+                continue;
+            }
+
+            if (main_socket < 0) {
+                lwan_status_info("Signal 2 (Interrupt) received");
+            } else {
+                lwan_status_info("Main socket closed for unknown reasons");
+            }
+
+            break;
         }
 
-        _push_request_fd(l, child_fd);
+        schedule_client(l, client_fd);
     }
 }

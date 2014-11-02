@@ -20,20 +20,16 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stddef.h>
+#include <arpa/inet.h>
 
 #include "lwan.h"
 #include "lwan-config.h"
 #include "lwan-http-authorize.h"
-
-enum {
-    HTTP_STR_GET  = MULTICHAR_CONSTANT('G','E','T',' '),
-    HTTP_STR_HEAD = MULTICHAR_CONSTANT('H','E','A','D'),
-    HTTP_STR_POST = MULTICHAR_CONSTANT('P','O','S','T')
-} lwan_http_method_str_t;
 
 typedef enum {
     FINALIZER_DONE,
@@ -41,18 +37,6 @@ typedef enum {
     FINALIZER_YIELD_TRY_AGAIN,
     FINALIZER_ERROR_TOO_LARGE
 } lwan_read_finalizer_t;
-
-enum {
-    HTTP_HDR_CONNECTION        = MULTICHAR_CONSTANT_L('C','o','n','n'),
-    HTTP_HDR_RANGE             = MULTICHAR_CONSTANT_L('R','a','n','g'),
-    HTTP_HDR_IF_MODIFIED_SINCE = MULTICHAR_CONSTANT_L('I','f','-','M'),
-    HTTP_HDR_ACCEPT            = MULTICHAR_CONSTANT_L('A','c','c','e'),
-    HTTP_HDR_CONTENT           = MULTICHAR_CONSTANT_L('C','o','n','t'),
-    HTTP_HDR_ENCODING          = MULTICHAR_CONSTANT_L('-','E','n','c'),
-    HTTP_HDR_LENGTH            = MULTICHAR_CONSTANT_L('-','L','e','n'),
-    HTTP_HDR_TYPE              = MULTICHAR_CONSTANT_L('-','T','y','p'),
-    HTTP_HDR_AUTHORIZATION     = MULTICHAR_CONSTANT_L('A','u','t','h'),
-} lwan_http_header_str_t;
 
 typedef struct lwan_request_parse_t_	lwan_request_parse_t;
 
@@ -70,15 +54,21 @@ struct lwan_request_parse_t_ {
     char connection;
 };
 
-static char _decode_hex_digit(char ch) __attribute__((pure));
-static bool _is_hex_digit(char ch) __attribute__((pure));
-static unsigned long _has_zero_byte(unsigned long n) __attribute__((pure));
-static unsigned long _is_space(char ch) __attribute__((pure));
-static char *_ignore_leading_whitespace(char *buffer) __attribute__((pure));
+static char decode_hex_digit(char ch) __attribute__((pure));
+static bool is_hex_digit(char ch) __attribute__((pure));
+static unsigned long has_zero_byte(unsigned long n) __attribute__((pure));
+static unsigned long is_space(char ch) __attribute__((pure));
+static char *ignore_leading_whitespace(char *buffer) __attribute__((pure));
 
 static ALWAYS_INLINE char *
-_identify_http_method(lwan_request_t *request, char *buffer)
+identify_http_method(lwan_request_t *request, char *buffer)
 {
+    enum {
+        HTTP_STR_GET  = MULTICHAR_CONSTANT('G','E','T',' '),
+        HTTP_STR_HEAD = MULTICHAR_CONSTANT('H','E','A','D'),
+        HTTP_STR_POST = MULTICHAR_CONSTANT('P','O','S','T')
+    };
+
     STRING_SWITCH(buffer) {
     case HTTP_STR_GET:
         request->flags |= REQUEST_METHOD_GET;
@@ -94,27 +84,27 @@ _identify_http_method(lwan_request_t *request, char *buffer)
 }
 
 static ALWAYS_INLINE char
-_decode_hex_digit(char ch)
+decode_hex_digit(char ch)
 {
     return (char)((ch <= '9') ? ch - '0' : (ch & 7) + 9);
 }
 
 static ALWAYS_INLINE bool
-_is_hex_digit(char ch)
+is_hex_digit(char ch)
 {
     return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
 }
 
 static size_t
-_url_decode(char *str)
+url_decode(char *str)
 {
     if (UNLIKELY(!str))
         return 0;
 
     char *ch, *decoded;
     for (decoded = ch = str; *ch; ch++) {
-        if (*ch == '%' && LIKELY(_is_hex_digit(ch[1]) && _is_hex_digit(ch[2]))) {
-            char tmp = (char)(_decode_hex_digit(ch[1]) << 4 | _decode_hex_digit(ch[2]));
+        if (*ch == '%' && LIKELY(is_hex_digit(ch[1]) && is_hex_digit(ch[2]))) {
+            char tmp = (char)(decode_hex_digit(ch[1]) << 4 | decode_hex_digit(ch[2]));
             if (UNLIKELY(!tmp))
                 return 0;
             *decoded++ = tmp;
@@ -131,16 +121,16 @@ _url_decode(char *str)
 }
 
 static int
-_key_value_compare_qsort_key(const void *a, const void *b)
+key_value_compare_qsort_key(const void *a, const void *b)
 {
     return strcmp(((lwan_key_value_t *)a)->key, ((lwan_key_value_t *)b)->key);
 }
 
 #define DECODE_AND_ADD() \
     do { \
-        if (LIKELY(_url_decode(key))) { \
+        if (LIKELY(url_decode(key))) { \
             kvs[values].key = key; \
-            if (LIKELY(_url_decode(value))) \
+            if (LIKELY(url_decode(value))) \
                 kvs[values].value = value; \
             else \
                 kvs[values].value = ""; \
@@ -151,7 +141,7 @@ _key_value_compare_qsort_key(const void *a, const void *b)
     } while(0)
 
 static void
-_parse_urlencoded_keyvalues(lwan_request_t *request,
+parse_urlencoded_keyvalues(lwan_request_t *request,
     lwan_value_t *helper_value, lwan_key_value_t **base, size_t *len)
 {
     if (!helper_value->value)
@@ -159,11 +149,10 @@ _parse_urlencoded_keyvalues(lwan_request_t *request,
 
     char *key = helper_value->value;
     char *value = NULL;
-    char *ch;
     size_t values = 0;
     lwan_key_value_t kvs[256];
 
-    for (ch = key; *ch; ch++) {
+    for (char *ch = key; *ch; ch++) {
         switch (*ch) {
         case '=':
             *ch = '\0';
@@ -185,7 +174,7 @@ oom:
     lwan_key_value_t *kv = coro_malloc(request->conn->coro,
                                     (1 + values) * sizeof(lwan_key_value_t));
     if (LIKELY(kv)) {
-        qsort(kvs, values, sizeof(lwan_key_value_t), _key_value_compare_qsort_key);
+        qsort(kvs, values, sizeof(lwan_key_value_t), key_value_compare_qsort_key);
         *base = memcpy(kv, kvs, (1 + values) * sizeof(lwan_key_value_t));
         *len = values;
     }
@@ -194,14 +183,14 @@ oom:
 #undef DECODE_AND_ADD
 
 static void
-_parse_query_string(lwan_request_t *request, lwan_request_parse_t *helper)
+parse_query_string(lwan_request_t *request, lwan_request_parse_t *helper)
 {
-    _parse_urlencoded_keyvalues(request, &helper->query_string,
+    parse_urlencoded_keyvalues(request, &helper->query_string,
             &request->query_params.base, &request->query_params.len);
 }
 
 static void
-_parse_post_data(lwan_request_t *request, lwan_request_parse_t *helper)
+parse_post_data(lwan_request_t *request, lwan_request_parse_t *helper)
 {
     static const char content_type[] = "application/x-www-form-urlencoded";
 
@@ -210,12 +199,12 @@ _parse_post_data(lwan_request_t *request, lwan_request_parse_t *helper)
     if (UNLIKELY(strcmp(helper->content_type.value, content_type)))
         return;
 
-    _parse_urlencoded_keyvalues(request, &helper->post_data,
+    parse_urlencoded_keyvalues(request, &helper->post_data,
             &request->post_data.base, &request->post_data.len);
 }
 
-static ALWAYS_INLINE char *
-_identify_http_path(lwan_request_t *request, char *buffer,
+static char *
+identify_http_path(lwan_request_t *request, char *buffer,
             lwan_request_parse_t *helper)
 {
     char *end_of_line = memchr(buffer, '\r',
@@ -289,15 +278,25 @@ _identify_http_path(lwan_request_t *request, char *buffer,
 #define CASE_HEADER(hdr_const,hdr_name) \
     case hdr_const: MATCH_HEADER(hdr_name);
 
-static ALWAYS_INLINE char *
-_parse_headers(lwan_request_parse_t *helper, char *buffer, char *buffer_end)
+static char *
+parse_headers(lwan_request_parse_t *helper, char *buffer, char *buffer_end)
 {
-    char *p;
+    enum {
+        HTTP_HDR_CONNECTION        = MULTICHAR_CONSTANT_L('C','o','n','n'),
+        HTTP_HDR_RANGE             = MULTICHAR_CONSTANT_L('R','a','n','g'),
+        HTTP_HDR_IF_MODIFIED_SINCE = MULTICHAR_CONSTANT_L('I','f','-','M'),
+        HTTP_HDR_ACCEPT            = MULTICHAR_CONSTANT_L('A','c','c','e'),
+        HTTP_HDR_CONTENT           = MULTICHAR_CONSTANT_L('C','o','n','t'),
+        HTTP_HDR_ENCODING          = MULTICHAR_CONSTANT_L('-','E','n','c'),
+        HTTP_HDR_LENGTH            = MULTICHAR_CONSTANT_L('-','L','e','n'),
+        HTTP_HDR_TYPE              = MULTICHAR_CONSTANT_L('-','T','y','p'),
+        HTTP_HDR_AUTHORIZATION     = MULTICHAR_CONSTANT_L('A','u','t','h'),
+    };
 
     if (UNLIKELY(!buffer))
         return NULL;
 
-    for (p = buffer; *p; buffer = ++p) {
+    for (char *p = buffer; *p; buffer = ++p) {
         char *value;
         size_t length;
 
@@ -353,8 +352,8 @@ end:
 #undef CASE_HEADER
 #undef MATCH_HEADER
 
-static ALWAYS_INLINE void
-_parse_if_modified_since(lwan_request_t *request, lwan_request_parse_t *helper)
+static void
+parse_if_modified_since(lwan_request_t *request, lwan_request_parse_t *helper)
 {
     if (UNLIKELY(!helper->if_modified_since.len))
         return;
@@ -371,8 +370,8 @@ _parse_if_modified_since(lwan_request_t *request, lwan_request_parse_t *helper)
     request->header.if_modified_since = timegm(&t);
 }
 
-static ALWAYS_INLINE void
-_parse_range(lwan_request_t *request, lwan_request_parse_t *helper)
+static void
+parse_range(lwan_request_t *request, lwan_request_parse_t *helper)
 {
     if (UNLIKELY(helper->range.len <= (sizeof("bytes=") - 1)))
         return;
@@ -384,13 +383,13 @@ _parse_range(lwan_request_t *request, lwan_request_parse_t *helper)
     range += sizeof("bytes=") - 1;
     off_t from, to;
 
-    if (sscanf(range, "%lu-%lu", &from, &to) == 2) {
+    if (sscanf(range, "%"PRIu64"-%"PRIu64, &from, &to) == 2) {
         request->header.range.from = from;
         request->header.range.to = to;
-    } else if (sscanf(range, "-%lu", &to) == 1) {
+    } else if (sscanf(range, "-%"PRIu64, &to) == 1) {
         request->header.range.from = 0;
         request->header.range.to = to;
-    } else if (sscanf(range, "%lu-", &from) == 1) {
+    } else if (sscanf(range, "%"PRIu64"-", &from) == 1) {
         request->header.range.from = from;
         request->header.range.to = -1;
     } else {
@@ -399,11 +398,9 @@ _parse_range(lwan_request_t *request, lwan_request_parse_t *helper)
     }
 }
 
-static ALWAYS_INLINE void
-_parse_accept_encoding(lwan_request_t *request, lwan_request_parse_t *helper)
+static void
+parse_accept_encoding(lwan_request_t *request, lwan_request_parse_t *helper)
 {
-    char *p;
-
     if (!helper->accept_encoding.len)
         return;
 
@@ -412,7 +409,7 @@ _parse_accept_encoding(lwan_request_t *request, lwan_request_parse_t *helper)
         ENCODING_DEFL2 = MULTICHAR_CONSTANT(' ','d','e','f')
     };
 
-    for (p = helper->accept_encoding.value; p && *p; p++) {
+    for (char *p = helper->accept_encoding.value; p && *p; p++) {
         STRING_SWITCH(p) {
         case ENCODING_DEFL1:
         case ENCODING_DEFL2:
@@ -426,27 +423,27 @@ _parse_accept_encoding(lwan_request_t *request, lwan_request_parse_t *helper)
 }
 
 static ALWAYS_INLINE unsigned long
-_has_zero_byte(unsigned long n)
+has_zero_byte(unsigned long n)
 {
     return ((n - 0x01010101UL) & ~n) & 0x80808080UL;
 }
 
 static ALWAYS_INLINE unsigned long
-_is_space(char ch)
+is_space(char ch)
 {
-    return _has_zero_byte((0x1010101UL * (unsigned long)ch) ^ 0x090a0d20UL);
+    return has_zero_byte((0x1010101UL * (unsigned long)ch) ^ 0x090a0d20UL);
 }
 
 static ALWAYS_INLINE char *
-_ignore_leading_whitespace(char *buffer)
+ignore_leading_whitespace(char *buffer)
 {
-    while (*buffer && _is_space(*buffer))
+    while (*buffer && is_space(*buffer))
         buffer++;
     return buffer;
 }
 
 static ALWAYS_INLINE void
-_compute_keep_alive_flag(lwan_request_t *request, lwan_request_parse_t *helper)
+compute_keep_alive_flag(lwan_request_t *request, lwan_request_parse_t *helper)
 {
     bool is_keep_alive;
     if (!(request->flags & REQUEST_IS_HTTP_1_0))
@@ -459,21 +456,21 @@ _compute_keep_alive_flag(lwan_request_t *request, lwan_request_parse_t *helper)
         request->conn->flags &= ~CONN_KEEP_ALIVE;
 }
 
-static lwan_http_status_t
-_read_from_request_socket(lwan_request_t *request, lwan_value_t *buffer,
-    const size_t buffer_size,
+static lwan_http_status_t read_from_request_socket(lwan_request_t *request,
+    lwan_value_t *buffer, const size_t buffer_size,
     lwan_read_finalizer_t (*finalizer)(size_t total_read, size_t buffer_size, lwan_value_t *buffer))
 {
     ssize_t n;
     size_t total_read = 0;
+    int packets_remaining = 16;
 
-    while(true) {
+    for (; packets_remaining > 0; packets_remaining--) {
         n = read(request->fd, buffer->value + total_read,
                     (size_t)(buffer_size - total_read));
         /* Client has shutdown orderly, nothing else to do; kill coro */
         if (UNLIKELY(n == 0)) {
             coro_yield(request->conn->coro, CONN_CORO_ABORT);
-            ASSERT_NOT_REACHED();
+            __builtin_unreachable();
         }
 
         if (UNLIKELY(n < 0)) {
@@ -498,7 +495,7 @@ yield_and_read_again:
 
             /* Unexpected error, kill coro */
             coro_yield(request->conn->coro, CONN_CORO_ABORT);
-            ASSERT_NOT_REACHED();
+            __builtin_unreachable();
         }
 
         total_read += (size_t)n;
@@ -512,14 +509,22 @@ yield_and_read_again:
         }
     }
 
+    /*
+     * packets_remaining reached zero: return a timeout error to avoid clients
+     * being intentionally slow and hogging the server.
+     *
+     * FIXME: What should be the best approach? Error with 408, or give some more
+     * time by fiddling with the connection's time to die?
+     */
+    return HTTP_TIMEOUT;
+
 out:
     buffer->len = (size_t)total_read;
     return HTTP_OK;
 }
 
-static lwan_read_finalizer_t
-_read_request_finalizer(size_t total_read, size_t buffer_size,
-    lwan_value_t *buffer)
+static lwan_read_finalizer_t read_request_finalizer(size_t total_read,
+    size_t buffer_size, lwan_value_t *buffer)
 {
     if (UNLIKELY(total_read < 4))
         return FINALIZER_YIELD_TRY_AGAIN;
@@ -540,14 +545,14 @@ _read_request_finalizer(size_t total_read, size_t buffer_size,
 }
 
 static ALWAYS_INLINE lwan_http_status_t
-_read_request(lwan_request_t *request, lwan_request_parse_t *helper)
+read_request(lwan_request_t *request, lwan_request_parse_t *helper)
 {
-    return _read_from_request_socket(request, &helper->buffer,
-                        DEFAULT_BUFFER_SIZE, _read_request_finalizer);
+    return read_from_request_socket(request, &helper->buffer,
+                        DEFAULT_BUFFER_SIZE, read_request_finalizer);
 }
 
 static lwan_read_finalizer_t
-_read_post_data_finalizer(size_t total_read, size_t buffer_size,
+read_post_data_finalizer(size_t total_read, size_t buffer_size,
     lwan_value_t *buffer __attribute__((unused)))
 {
     if (LIKELY(total_read == buffer_size))
@@ -555,12 +560,14 @@ _read_post_data_finalizer(size_t total_read, size_t buffer_size,
     return FINALIZER_YIELD_TRY_AGAIN;
 }
 
-static ALWAYS_INLINE lwan_http_status_t
-_read_post_data(lwan_request_t *request, lwan_request_parse_t *helper, char
+static lwan_http_status_t
+read_post_data(lwan_request_t *request, lwan_request_parse_t *helper, char
             *buffer)
 {
     long parsed_length;
 
+    if (!helper->content_length.value)
+        return HTTP_BAD_REQUEST;
     parsed_length = parse_long(helper->content_length.value, DEFAULT_BUFFER_SIZE);
     if (UNLIKELY(parsed_length > DEFAULT_BUFFER_SIZE))
         return HTTP_TOO_LARGE;
@@ -585,10 +592,10 @@ _read_post_data(lwan_request_t *request, lwan_request_parse_t *helper, char
     helper->post_data.len = (size_t)curr_post_data_len;
     helper->post_data.value += curr_post_data_len;
 
-    lwan_http_status_t status = _read_from_request_socket(request,
+    lwan_http_status_t status = read_from_request_socket(request,
                         &helper->post_data,
                         post_data_size - curr_post_data_len,
-                        _read_post_data_finalizer);
+                        read_post_data_finalizer);
     if (status != HTTP_OK)
         return status;
 
@@ -596,36 +603,36 @@ _read_post_data(lwan_request_t *request, lwan_request_parse_t *helper, char
     return HTTP_OK;
 }
 
-static ALWAYS_INLINE lwan_http_status_t
-_parse_http_request(lwan_request_t *request, lwan_request_parse_t *helper)
+static lwan_http_status_t
+parse_http_request(lwan_request_t *request, lwan_request_parse_t *helper)
 {
     char *buffer;
 
-    buffer = _ignore_leading_whitespace(helper->buffer.value);
+    buffer = ignore_leading_whitespace(helper->buffer.value);
     if (UNLIKELY(!*buffer))
         return HTTP_BAD_REQUEST;
 
-    buffer = _identify_http_method(request, buffer);
+    buffer = identify_http_method(request, buffer);
     if (UNLIKELY(!buffer))
         return HTTP_NOT_ALLOWED;
 
-    buffer = _identify_http_path(request, buffer, helper);
+    buffer = identify_http_path(request, buffer, helper);
     if (UNLIKELY(!buffer))
         return HTTP_BAD_REQUEST;
 
-    buffer = _parse_headers(helper, buffer, helper->buffer.value + helper->buffer.len);
+    buffer = parse_headers(helper, buffer, helper->buffer.value + helper->buffer.len);
     if (UNLIKELY(!buffer))
         return HTTP_BAD_REQUEST;
 
-    size_t decoded_len = _url_decode(request->url.value);
+    size_t decoded_len = url_decode(request->url.value);
     if (UNLIKELY(!decoded_len))
         return HTTP_BAD_REQUEST;
     request->original_url.len = request->url.len = decoded_len;
 
-    _compute_keep_alive_flag(request, helper);
+    compute_keep_alive_flag(request, helper);
 
     if (request->flags & REQUEST_METHOD_POST) {
-        lwan_http_status_t status = _read_post_data(request, helper, buffer);
+        lwan_http_status_t status = read_post_data(request, helper, buffer);
         if (UNLIKELY(status != HTTP_OK))
             return status;
     }
@@ -633,26 +640,26 @@ _parse_http_request(lwan_request_t *request, lwan_request_parse_t *helper)
     return HTTP_OK;
 }
 
-static ALWAYS_INLINE lwan_http_status_t
-_prepare_for_response(lwan_url_map_t *url_map,
+static lwan_http_status_t
+prepare_for_response(lwan_url_map_t *url_map,
                       lwan_request_t *request,
                       lwan_request_parse_t *helper)
 {
     if (url_map->flags & HANDLER_PARSE_QUERY_STRING)
-        _parse_query_string(request, helper);
+        parse_query_string(request, helper);
 
     if (url_map->flags & HANDLER_PARSE_IF_MODIFIED_SINCE)
-        _parse_if_modified_since(request, helper);
+        parse_if_modified_since(request, helper);
 
     if (url_map->flags & HANDLER_PARSE_RANGE)
-        _parse_range(request, helper);
+        parse_range(request, helper);
 
     if (url_map->flags & HANDLER_PARSE_ACCEPT_ENCODING)
-        _parse_accept_encoding(request, helper);
+        parse_accept_encoding(request, helper);
 
     if (request->flags & REQUEST_METHOD_POST) {
         if (url_map->flags & HANDLER_PARSE_POST_DATA)
-            _parse_post_data(request, helper);
+            parse_post_data(request, helper);
         else
             return HTTP_NOT_ALLOWED;
     }
@@ -663,6 +670,13 @@ _prepare_for_response(lwan_url_map_t *url_map,
                         url_map->authorization.realm,
                         url_map->authorization.password_file))
             return HTTP_NOT_AUTHORIZED;
+    }
+
+    if (url_map->flags & HANDLER_REMOVE_LEADING_SLASH) {
+        while (*request->url.value == '/' && request->url.len > 0) {
+            ++request->url.value;
+            --request->url.len;
+        }
     }
 
     return HTTP_OK;
@@ -681,7 +695,7 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
         }
     };
 
-    status = _read_request(request, &helper);
+    status = read_request(request, &helper);
     if (UNLIKELY(status != HTTP_OK)) {
         /* If status is anything but a bad request at this point, give up. */
         if (status != HTTP_BAD_REQUEST)
@@ -690,7 +704,7 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
         return;
     }
 
-    status = _parse_http_request(request, &helper);
+    status = parse_http_request(request, &helper);
     if (UNLIKELY(status != HTTP_OK)) {
         lwan_default_response(request, status);
         return;
@@ -705,18 +719,18 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
     request->url.value += url_map->prefix_len;
     request->url.len -= url_map->prefix_len;
 
-    status = _prepare_for_response(url_map, request, &helper);
+    status = prepare_for_response(url_map, request, &helper);
     if (UNLIKELY(status != HTTP_OK)) {
         lwan_default_response(request, status);
         return;
     }
 
-    status = url_map->callback(request, &request->response, url_map->data);
+    status = url_map->handler(request, &request->response, url_map->data);
     lwan_response(request, status);
 }
 
 static const char *
-_value_array_bsearch(lwan_key_value_t *base, const size_t len, const char *key)
+value_array_bsearch(lwan_key_value_t *base, const size_t len, const char *key)
 {
     if (UNLIKELY(!len))
         return NULL;
@@ -741,21 +755,21 @@ _value_array_bsearch(lwan_key_value_t *base, const size_t len, const char *key)
     return NULL;
 }
 
-const char *
+ALWAYS_INLINE const char *
 lwan_request_get_query_param(lwan_request_t *request, const char *key)
 {
-    return _value_array_bsearch(request->query_params.base,
+    return value_array_bsearch(request->query_params.base,
                                             request->query_params.len, key);
 }
 
-const char *
+ALWAYS_INLINE const char *
 lwan_request_get_post_param(lwan_request_t *request, const char *key)
 {
-    return _value_array_bsearch(request->post_data.base,
+    return value_array_bsearch(request->post_data.base,
                                             request->post_data.len, key);
 }
 
-int
+ALWAYS_INLINE int
 lwan_connection_get_fd(lwan_connection_t *conn)
 {
     return (int)(ptrdiff_t)(conn - conn->thread->lwan->conns);
@@ -763,21 +777,16 @@ lwan_connection_get_fd(lwan_connection_t *conn)
 
 const char *
 lwan_request_get_remote_address(lwan_request_t *request,
-            char *buffer)
+            char buffer[static INET6_ADDRSTRLEN])
 {
-    struct sockaddr_in sock_addr;
-    socklen_t sock_len = sizeof(struct sockaddr_in);
-    if (UNLIKELY(getpeername(request->fd, &sock_addr, &sock_len) < 0))
+    struct sockaddr_storage sock_addr = { 0 };
+    socklen_t sock_len = sizeof(struct sockaddr_storage);
+    if (UNLIKELY(getpeername(request->fd, (struct sockaddr *)&sock_addr, &sock_len) < 0))
         return NULL;
 
-    /* The definition of inet_ntoa() in the standard is not thread-safe. The
-     * glibc version uses a static buffer stored in the TLS to make do, but
-     * in the end, inet_ntoa() is actually a call to snprintf().  Call it
-     * ourselves, using a user-supplied buffer.  This should be a tiny wee
-     * little bit faster.  */
-    unsigned char *octets = (unsigned char *) &sock_addr.sin_addr.s_addr;
-    if (UNLIKELY(snprintf(buffer, INET_ADDRSTRLEN, "%d.%d.%d.%d",
-                octets[0], octets[1], octets[2], octets[3]) < 0))
-        return NULL;
-    return buffer;
+    if (sock_addr.ss_family == AF_INET)
+        return inet_ntop(AF_INET, &((struct sockaddr_in *)&sock_addr)->sin_addr,
+                         buffer, INET6_ADDRSTRLEN);
+    return inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sock_addr)->sin6_addr,
+                     buffer, INET6_ADDRSTRLEN);
 }

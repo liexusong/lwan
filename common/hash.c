@@ -19,10 +19,7 @@
  */
 
 #include "hash.h"
-
-#ifndef USE_HARDWARE_CRC32
 #include "murmur3.h"
-#endif
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -68,18 +65,20 @@ static inline unsigned hash_int(const void *keyptr)
 	return key;
 }
 
-#ifdef USE_HARDWARE_CRC32
+#if defined(HAVE_BUILTIN_CPU_INIT) && defined(USE_HARDWARE_CRC32)
 static inline unsigned hash_crc32(const void *keyptr)
 {
 	unsigned hash = 0xABAD1DEA;
 	const char *key = keyptr;
 	size_t len = strlen(key);
 
+#if __x86_64__
 	while (len >= sizeof(uint64_t)) {
 		hash = (unsigned)__builtin_ia32_crc32di(hash, *((uint64_t *)key));
 		key += sizeof(uint64_t);
 		len -= sizeof(uint64_t);
 	}
+#endif	/* __x86_64__ */
 	while (len >= sizeof(uint32_t)) {
 		hash = __builtin_ia32_crc32si(hash, *((uint32_t *)key));
 		key += sizeof(uint32_t);
@@ -133,12 +132,21 @@ struct hash *hash_int_new(void (*free_key)(void *value),
 struct hash *hash_str_new(void (*free_key)(void *value),
 			void (*free_value)(void *value))
 {
-	return hash_internal_new(
-#ifdef USE_HARDWARE_CRC32
-			hash_crc32,
+	unsigned (*hash_func)(const void *key);
+
+#if defined(HAVE_BUILTIN_CPU_INIT) && defined(USE_HARDWARE_CRC32)
+	__builtin_cpu_init();
+	if (__builtin_cpu_supports("sse4.2")) {
+		hash_func = hash_crc32;
+	} else {
+		hash_func = murmur3_simple;
+	}
 #else
-			murmur3_simple,
+	hash_func = murmur3_simple;
 #endif
+
+	return hash_internal_new(
+			hash_func,
 			(int (*)(const void *, const void *))strcmp,
 			free_key,
 			free_value);
@@ -201,6 +209,10 @@ int hash_add(struct hash *hash, const void *key, const void *value)
 			continue;
 		if (hash->free_value)
 			hash->free_value((void *)entry->value);
+		if (hash->free_key)
+			hash->free_key((void *)entry->key);
+
+		entry->key = key;
 		entry->value = value;
 		return 0;
 	}

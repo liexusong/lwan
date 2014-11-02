@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <netinet/in.h>
 
 #include "int-to-str.h"
 #include "lwan.h"
@@ -102,7 +103,7 @@ get_request_method(lwan_request_t *request)
 static void
 log_request(lwan_request_t *request, lwan_http_status_t status)
 {
-    char ip_buffer[16];
+    char ip_buffer[INET6_ADDRSTRLEN];
 
     lwan_status_debug("%s \"%s %s HTTP/%s\" %d %s",
         lwan_request_get_remote_address(request, ip_buffer),
@@ -126,6 +127,7 @@ lwan_response(lwan_request_t *request, lwan_http_status_t status)
         if (UNLIKELY(!strbuf_reset_length(request->response.buffer)))
             coro_yield(request->conn->coro, CONN_CORO_ABORT);
         lwan_response_send_chunk(request);
+        log_request(request, status);
         return;
     }
 
@@ -139,9 +141,9 @@ lwan_response(lwan_request_t *request, lwan_http_status_t status)
     if (UNLIKELY(!request->response.mime_type)) {
         lwan_default_response(request, status);
         return;
-    } else {
-        log_request(request, status);
     }
+
+    log_request(request, status);
 
     if (request->response.stream.callback) {
         lwan_http_status_t callback_status;
@@ -200,9 +202,8 @@ lwan_default_response(lwan_request_t *request, lwan_http_status_t status)
 
 #define APPEND_STRING(str_) \
     do { \
-        len = strlen(str_); \
-        RETURN_0_ON_OVERFLOW(len); \
-        p_headers = mempcpy(p_headers, (str_), len); \
+        size_t len = strlen(str_); \
+        APPEND_STRING_LEN((str_), len); \
     } while(0)
 
 #define APPEND_CHAR(value_) \
@@ -214,16 +215,9 @@ lwan_default_response(lwan_request_t *request, lwan_http_status_t status)
 #define APPEND_CHAR_NOCHECK(value_) \
     *p_headers++ = (value_)
 
-#define APPEND_INT8(value_) \
-    do { \
-        RETURN_0_ON_OVERFLOW(3); \
-        APPEND_CHAR_NOCHECK((char)(((value_) / 100) % 10 + '0')); \
-        APPEND_CHAR_NOCHECK((char)(((value_) / 10) % 10 + '0')); \
-        APPEND_CHAR_NOCHECK((char)((value_) % 10 + '0')); \
-    } while(0)
-
 #define APPEND_UINT(value_) \
     do { \
+        size_t len; \
         char *tmp = uint_to_string((value_), buffer, &len); \
         RETURN_0_ON_OVERFLOW(len); \
         APPEND_STRING_LEN(tmp, len); \
@@ -238,7 +232,8 @@ lwan_prepare_response_header(lwan_request_t *request, lwan_http_status_t status,
     char *p_headers;
     char *p_headers_end = headers + headers_buf_size;
     char buffer[INT_TO_STR_BUFFER_SIZE];
-    size_t len;
+    bool date_overridden = false;
+    bool expires_overridden = false;
 
     p_headers = headers;
 
@@ -246,9 +241,7 @@ lwan_prepare_response_header(lwan_request_t *request, lwan_http_status_t status,
         APPEND_CONSTANT("HTTP/1.0 ");
     else
         APPEND_CONSTANT("HTTP/1.1 ");
-    APPEND_INT8(status);
-    APPEND_CHAR(' ');
-    APPEND_STRING(lwan_http_status_as_string(status));
+    APPEND_STRING(lwan_http_status_as_string_with_code(status));
 
     if (request->flags & RESPONSE_CHUNKED_ENCODING) {
         APPEND_CONSTANT("\r\nTransfer-Encoding: chunked");
@@ -274,11 +267,19 @@ lwan_prepare_response_header(lwan_request_t *request, lwan_http_status_t status,
         lwan_key_value_t *header;
 
         for (header = request->response.headers; header->key; header++) {
-            APPEND_CHAR('\r');
-            APPEND_CHAR('\n');
+            if (UNLIKELY(!strcmp(header->key, "Server")))
+                continue;
+            if (UNLIKELY(!strcmp(header->key, "Date")))
+                date_overridden = true;
+            if (UNLIKELY(!strcmp(header->key, "Expires")))
+                expires_overridden = true;
+
+            RETURN_0_ON_OVERFLOW(4);
+            APPEND_CHAR_NOCHECK('\r');
+            APPEND_CHAR_NOCHECK('\n');
             APPEND_STRING(header->key);
-            APPEND_CHAR(':');
-            APPEND_CHAR(' ');
+            APPEND_CHAR_NOCHECK(':');
+            APPEND_CHAR_NOCHECK(' ');
             APPEND_STRING(header->value);
         }
     } else if (status == HTTP_NOT_AUTHORIZED) {
@@ -293,22 +294,28 @@ lwan_prepare_response_header(lwan_request_t *request, lwan_http_status_t status,
         }
     }
 
-    APPEND_CONSTANT("\r\nDate: ");
-    APPEND_STRING_LEN(request->conn->thread->date.date, 29);
+    if (LIKELY(!date_overridden)) {
+        APPEND_CONSTANT("\r\nDate: ");
+        APPEND_STRING_LEN(request->conn->thread->date.date, 29);
+    }
 
-    APPEND_CONSTANT("\r\nExpires: ");
-    APPEND_STRING_LEN(request->conn->thread->date.expires, 29);
+    if (LIKELY(!expires_overridden)) {
+        APPEND_CONSTANT("\r\nExpires: ");
+        APPEND_STRING_LEN(request->conn->thread->date.expires, 29);
+    }
 
     APPEND_CONSTANT("\r\nServer: lwan\r\n\r\n\0");
 
     return (size_t)(p_headers - headers - 1);
 }
 
-#undef APPEND_STRING_LEN
-#undef APPEND_STRING
-#undef APPEND_CONSTANT
 #undef APPEND_CHAR
-#undef APPEND_INT
+#undef APPEND_CHAR_NOCHECK
+#undef APPEND_CONSTANT
+#undef APPEND_STRING
+#undef APPEND_STRING_LEN
+#undef APPEND_UINT
+#undef RETURN_0_ON_OVERFLOW
 
 bool
 lwan_response_set_chunked(lwan_request_t *request, lwan_http_status_t status)
@@ -347,7 +354,7 @@ lwan_response_send_chunk(lwan_request_t *request)
     }
 
     char chunk_size[3 * sizeof(size_t) + 2];
-    int converted_len = snprintf(chunk_size, sizeof(chunk_size), "%lx\r\n", buffer_len);
+    int converted_len = snprintf(chunk_size, sizeof(chunk_size), "%zx\r\n", buffer_len);
     if (UNLIKELY(converted_len < 0))
         return;
     size_t chunk_size_len = (size_t)converted_len;
@@ -432,6 +439,8 @@ lwan_response_send_event(lwan_request_t *request, const char *event)
 
     lwan_writev(request, vec, last);
 
-    strbuf_reset_length(request->response.buffer);
-    coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+    if (UNLIKELY(strbuf_reset_length(request->response.buffer)))
+        coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+    else
+        coro_yield(request->conn->coro, CONN_CORO_ABORT);
 }

@@ -1,10 +1,3 @@
-if (NOT USE_HARDWARE_CRC32)
-	set(GENERIC_SOURCES
-		murmur3.c
-	)
-endif ()
-
-
 add_library(lwan-common STATIC
 	base64.c
 	hash.c
@@ -17,6 +10,7 @@ add_library(lwan-common STATIC
 	lwan-http-authorize.c
 	lwan-io-wrappers.c
 	lwan-job.c
+	lwan-redirect.c
 	lwan-request.c
 	lwan-response.c
 	lwan-serve-files.c
@@ -29,7 +23,7 @@ add_library(lwan-common STATIC
 	realpathat.c
 	sd-daemon.c
 	strbuf.c
-	${GENERIC_SOURCES}
+	murmur3.c
 )
 
 find_package(PythonInterp)

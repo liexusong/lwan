@@ -20,6 +20,8 @@
 #ifndef LWAN_CACHE_H
 #define LWAN_CACHE_H
 
+#include <time.h>
+
 #include "list.h"
 #include "lwan-coro.h"
 
@@ -28,7 +30,7 @@ struct cache_entry_t {
   char *key;
   unsigned refs;
   unsigned flags;
-  time_t time_to_die;
+  struct timespec time_to_die;
 };
 
 typedef struct cache_entry_t *(*CreateEntryCallback)(
@@ -49,8 +51,5 @@ struct cache_entry_t *cache_get_and_ref_entry(struct cache_t *cache,
 void cache_entry_unref(struct cache_t *cache, struct cache_entry_t *entry);
 struct cache_entry_t *cache_coro_get_and_ref_entry(struct cache_t *cache,
       coro_t *coro, const char *key);
-
-void cache_get_stats(struct cache_t *cache, unsigned *hits,
-      unsigned *misses, unsigned *evicted);
 
 #endif /* LWAN_CACHE_H */

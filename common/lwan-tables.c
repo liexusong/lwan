@@ -26,14 +26,6 @@
 #include "lwan.h"
 #include "mime-types.h"
 
-enum {
-    EXT_JPG = MULTICHAR_CONSTANT_L('.','j','p','g'),
-    EXT_PNG = MULTICHAR_CONSTANT_L('.','p','n','g'),
-    EXT_HTM = MULTICHAR_CONSTANT_L('.','h','t','m'),
-    EXT_CSS = MULTICHAR_CONSTANT_L('.','c','s','s'),
-    EXT_TXT = MULTICHAR_CONSTANT_L('.','t','x','t'),
-    EXT_JS  = MULTICHAR_CONSTANT_L('.','j','s',0),
-} lwan_mime_ext_t;
 
 static unsigned char uncompressed_mime_entries[MIME_UNCOMPRESSED_LEN];
 static struct mime_entry mime_entries[MIME_ENTRIES];
@@ -58,13 +50,12 @@ lwan_tables_init(void)
         lwan_status_critical("Expected uncompressed length %d, got %ld",
             MIME_UNCOMPRESSED_LEN, uncompressed_length);
 
-    size_t i;
     unsigned char *ptr = uncompressed_mime_entries;
-    for (i = 0; i < MIME_ENTRIES; i++) {
+    for (size_t i = 0; i < MIME_ENTRIES; i++) {
         mime_entries[i].extension = (char*)ptr;
-        ptr = rawmemchr(ptr + 1, '\0') + 1;
+        ptr = (unsigned char *)rawmemchr(ptr + 1, '\0') + 1;
         mime_entries[i].type = (char*)ptr;
-        ptr = rawmemchr(ptr + 1, '\0') + 1;
+        ptr = (unsigned char *)rawmemchr(ptr + 1, '\0') + 1;
     }
 
     mime_entries_initialized = true;
@@ -76,7 +67,7 @@ lwan_tables_shutdown(void)
 }
 
 static int
-_compare_mime_entry(const void *a, const void *b)
+compare_mime_entry(const void *a, const void *b)
 {
     const struct mime_entry *me1 = a;
     const struct mime_entry *me2 = b;
@@ -89,6 +80,15 @@ lwan_determine_mime_type_for_file_name(const char *file_name)
     char *last_dot = strrchr(file_name, '.');
     if (UNLIKELY(!last_dot))
         goto fallback;
+
+    enum {
+        EXT_JPG = MULTICHAR_CONSTANT_L('.','j','p','g'),
+        EXT_PNG = MULTICHAR_CONSTANT_L('.','p','n','g'),
+        EXT_HTM = MULTICHAR_CONSTANT_L('.','h','t','m'),
+        EXT_CSS = MULTICHAR_CONSTANT_L('.','c','s','s'),
+        EXT_TXT = MULTICHAR_CONSTANT_L('.','t','x','t'),
+        EXT_JS  = MULTICHAR_CONSTANT_L('.','j','s',0),
+    };
 
     STRING_SWITCH_L(last_dot) {
     case EXT_CSS: return "text/css";
@@ -103,7 +103,7 @@ lwan_determine_mime_type_for_file_name(const char *file_name)
         struct mime_entry *entry, key = { .extension = last_dot + 1 };
 
         entry = bsearch(&key, mime_entries, MIME_ENTRIES,
-                       sizeof(struct mime_entry), _compare_mime_entry);
+                       sizeof(struct mime_entry), compare_mime_entry);
         if (LIKELY(entry))
             return entry->type;
     }
@@ -113,24 +113,31 @@ fallback:
 }
 
 const char *
-lwan_http_status_as_string(lwan_http_status_t status)
+lwan_http_status_as_string_with_code(lwan_http_status_t status)
 {
     switch (status) {
-    case HTTP_OK: return "OK";
-    case HTTP_PARTIAL_CONTENT: return "Partial content";
-    case HTTP_MOVED_PERMANENTLY: return "Moved permanently";
-    case HTTP_NOT_MODIFIED: return "Not modified";
-    case HTTP_BAD_REQUEST: return "Bad request";
-    case HTTP_NOT_AUTHORIZED: return "Not authorized";
-    case HTTP_NOT_FOUND: return "Not found";
-    case HTTP_FORBIDDEN: return "Forbidden";
-    case HTTP_NOT_ALLOWED: return "Not allowed";
-    case HTTP_TOO_LARGE: return "Request too large";
-    case HTTP_RANGE_UNSATISFIABLE: return "Requested range unsatisfiable";
-    case HTTP_INTERNAL_ERROR: return "Internal server error";
-    case HTTP_UNAVAILABLE: return "Service unavailable";
+    case HTTP_OK: return "200 OK";
+    case HTTP_PARTIAL_CONTENT: return "206 Partial content";
+    case HTTP_MOVED_PERMANENTLY: return "301 Moved permanently";
+    case HTTP_NOT_MODIFIED: return "304 Not modified";
+    case HTTP_BAD_REQUEST: return "400 Bad request";
+    case HTTP_NOT_AUTHORIZED: return "401 Not authorized";
+    case HTTP_FORBIDDEN: return "403 Forbidden";
+    case HTTP_NOT_FOUND: return "404 Not found";
+    case HTTP_NOT_ALLOWED: return "405 Not allowed";
+    case HTTP_TIMEOUT: return "408 Request timeout";
+    case HTTP_TOO_LARGE: return "413 Request too large";
+    case HTTP_RANGE_UNSATISFIABLE: return "416 Requested range unsatisfiable";
+    case HTTP_INTERNAL_ERROR: return "500 Internal server error";
+    case HTTP_UNAVAILABLE: return "503 Service unavailable";
     }
-    return "Invalid";
+    return "999 Invalid";
+}
+
+ALWAYS_INLINE const char *
+lwan_http_status_as_string(lwan_http_status_t status)
+{
+    return lwan_http_status_as_string_with_code(status) + 4;
 }
 
 const char *
@@ -143,9 +150,10 @@ lwan_http_status_as_descriptive_string(lwan_http_status_t status)
     case HTTP_NOT_MODIFIED: return "The content has not changed since previous request.";
     case HTTP_BAD_REQUEST: return "The client has issued a bad request.";
     case HTTP_NOT_AUTHORIZED: return "Client has no authorization to access this resource.";
-    case HTTP_NOT_FOUND: return "The requested resource could not be found on this server.";
     case HTTP_FORBIDDEN: return "Access to this resource has been denied.";
+    case HTTP_NOT_FOUND: return "The requested resource could not be found on this server.";
     case HTTP_NOT_ALLOWED: return "The requested method is not allowed by this server.";
+    case HTTP_TIMEOUT: return "Client did not produce a request within expected timeframe.";
     case HTTP_TOO_LARGE: return "The request entity is too large.";
     case HTTP_RANGE_UNSATISFIABLE: return "The server can't supply the requested portion of the requested resource.";
     case HTTP_INTERNAL_ERROR: return "The server encountered an internal error that couldn't be recovered from.";

@@ -129,8 +129,8 @@ main(void)
 {
     lwan_t l;
 
-    lwan_init(&l);
-    lwan_main_loop(&l);
+    lwan_init(&l); // 初始化lwan服务器
+    lwan_main_loop(&l); // 进行主循环
     lwan_shutdown(&l);
 
     return 0;

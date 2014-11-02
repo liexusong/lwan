@@ -51,6 +51,10 @@ typedef enum {
     TPL_ACTION_LAST
 } lwan_tpl_action_t;
 
+typedef enum {
+    TPL_FLAG_NEGATE = 1<<0
+} lwan_tpl_flag_t;
+
 enum {
     STATE_DEFAULT,
     STATE_FIRST_BRACE,
@@ -63,6 +67,7 @@ enum {
 struct lwan_tpl_chunk_t_ {
     struct list_node list;
     lwan_tpl_action_t action;
+    lwan_tpl_flag_t flags;
     void *data;
 };
 
@@ -89,9 +94,7 @@ struct chunk_descriptor {
 static lwan_var_descriptor_t *
 symtab_lookup(struct parser_state *state, const char *var_name)
 {
-    struct symtab *tab = state->symtab;
-
-    for (; tab; tab = tab->next) {
+    for (struct symtab *tab = state->symtab; tab; tab = tab->next) {
         lwan_var_descriptor_t *var = hash_find(tab->hash, var_name);
         if (var)
             return var;
@@ -135,61 +138,76 @@ symtab_pop(struct parser_state *state)
     free(tab);
 }
 
-char *
-_lwan_tpl_int_to_str(void *ptr, bool *allocated, size_t *length)
+void
+lwan_append_int_to_strbuf(strbuf_t *buf, void *ptr)
 {
-    char buf[INT_TO_STR_BUFFER_SIZE];
-    char *ret;
+    char convertbuf[INT_TO_STR_BUFFER_SIZE];
+    size_t len;
+    char *converted;
 
-    ret = int_to_string(*(int *)ptr, buf, length);
-    *allocated = true;
-
-    return strdup(ret);
+    converted = int_to_string(*(int *)ptr, convertbuf, &len);
+    strbuf_append_str(buf, converted, len);
 }
 
 bool
-_lwan_tpl_int_is_empty(void *ptr)
+lwan_tpl_int_is_empty(void *ptr)
 {
     return (*(int *)ptr) == 0;
 }
 
-char *
-_lwan_tpl_double_to_str(void *ptr, bool *allocated, size_t *length __attribute__((unused)))
+void
+lwan_append_double_to_strbuf(strbuf_t *buf, void *ptr)
 {
-    char buf[32];
-
-    snprintf(buf, 32, "%f", *(double *)ptr);
-    *allocated = true;
-
-    return strdup(buf);
+    strbuf_append_printf(buf, "%f", *(double *)ptr);
 }
 
 bool
-_lwan_tpl_double_is_empty(void *ptr)
+lwan_tpl_double_is_empty(void *ptr)
 {
     return (*(double *)ptr) == 0.0f;
 }
 
-char *
-_lwan_tpl_str_to_str(void *ptr, bool *allocated, size_t *length)
+void
+lwan_append_str_to_strbuf(strbuf_t *buf, void *ptr)
 {
     struct v {
         char *str;
     } *v = ptr;
 
-    if (UNLIKELY(!v->str)) {
-        *length = 0;
-        *allocated = false;
-        return "";
-    }
+    if (LIKELY(v->str))
+        strbuf_append_str(buf, v->str, 0);
+}
 
-    *length = strlen(v->str);
-    *allocated = false;
-    return v->str;
+void
+lwan_append_str_escaped_to_strbuf(strbuf_t *buf, void *ptr)
+{
+    struct v {
+        char *str;
+    } *v = ptr;
+
+    if (UNLIKELY(!v->str))
+        return;
+
+    for (char *p = v->str; *p; p++) {
+        if (*p == '<')
+            strbuf_append_str(buf, "&lt;", 4);
+        else if (*p == '>')
+            strbuf_append_str(buf, "&gt;", 4);
+        else if (*p == '&')
+            strbuf_append_str(buf, "&amp;", 5);
+        else if (*p == '"')
+            strbuf_append_str(buf, "&quot;", 6);
+        else if (*p == '\'')
+            strbuf_append_str(buf, "&#x27;", 6);
+        else if (*p == '/')
+            strbuf_append_str(buf, "&#x2f;", 6);
+        else
+            strbuf_append_char(buf, *p);
+    }
 }
 
 bool
-_lwan_tpl_str_is_empty(void *ptr)
+lwan_tpl_str_is_empty(void *ptr)
 {
     char *str = ptr;
     if (!str)
@@ -237,7 +255,24 @@ compile_append_var(struct parser_state *state, strbuf_t *buf,
     char *variable = strbuf_get_buffer(buf);
     size_t length = strbuf_get_length(buf) - 1;
 
+    chunk->flags = 0;
+
+next_char:
     switch (*variable) {
+    case '^':
+        chunk->flags ^= TPL_FLAG_NEGATE;
+        variable++;
+        length--;
+        if (!length)
+            goto nokey;
+
+        goto next_char;
+
+    case '!':
+        free(chunk);
+        strbuf_reset(buf);
+        return 0;
+
     case '>': {
         char template_file[PATH_MAX];
         snprintf(template_file, sizeof(template_file), "%s.tpl", variable + 1);
@@ -486,14 +521,18 @@ post_process_template(lwan_tpl_t *tpl)
             cd->chunk = chunk;
             prev_chunk->data = cd;
         } else if (chunk->action == TPL_ACTION_LIST_START_ITER) {
+            lwan_tpl_flag_t flags = chunk->flags;
+
             prev_chunk = chunk;
 
             while ((chunk = (lwan_tpl_chunk_t *) chunk->list.next)) {
                 if (chunk->action == TPL_ACTION_LAST)
                     break;
                 if (chunk->action == TPL_ACTION_LIST_END_ITER
-                            && chunk->data == prev_chunk)
+                            && chunk->data == prev_chunk) {
+                    chunk->flags |= flags;
                     break;
+                }
             }
 
             struct chunk_descriptor *cd = malloc(sizeof(*cd));
@@ -647,29 +686,13 @@ until_iter_end(lwan_tpl_chunk_t *chunk, void *data)
     return true;
 }
 
-static char*
-var_get_as_string(lwan_tpl_chunk_t *chunk,
-                  void *variables,
-                  bool *allocated,
-                  size_t *length)
+static void
+append_var_to_strbuf(lwan_tpl_chunk_t *chunk, void *variables,
+                     strbuf_t *buf)
 {
     lwan_var_descriptor_t *descriptor = chunk->data;
-    if (UNLIKELY(!descriptor))
-        goto end;
-
-    char *value;
-    value = descriptor->get_as_string((void *)((char *)variables + descriptor->offset),
-                allocated, length);
-    if (LIKELY(value))
-        return value;
-
-end:
-    if (LIKELY(allocated))
-        *allocated = false;
-
-    if (LIKELY(length))
-        *length = 0;
-    return NULL;
+    if (LIKELY(descriptor))
+        descriptor->append_to_strbuf(buf, (char *)variables + descriptor->offset);
 }
 
 static bool
@@ -682,7 +705,7 @@ var_get_is_empty(lwan_var_descriptor_t *descriptor,
     return descriptor->get_is_empty((void *)((char *)variables + descriptor->offset));
 }
 
-lwan_tpl_chunk_t *
+static lwan_tpl_chunk_t *
 lwan_tpl_apply_until(lwan_tpl_t *tpl,
     lwan_tpl_chunk_t *chunks, strbuf_t *buf,
     void *variables,
@@ -707,31 +730,21 @@ lwan_tpl_apply_until(lwan_tpl_t *tpl,
         case TPL_ACTION_APPEND_CHAR:
             strbuf_append_char(buf, (char)(uintptr_t)chunk->data);
             break;
-        case TPL_ACTION_VARIABLE: {
-            bool allocated;
-            size_t length;
-            char *value;
-
-            value = var_get_as_string(chunk, variables,
-                    &allocated, &length);
-            strbuf_append_str(buf, value, length);
-            if (allocated)
-                free(value);
+        case TPL_ACTION_VARIABLE:
+            append_var_to_strbuf(chunk, variables, buf);
             break;
-        }
         case TPL_ACTION_IF_VARIABLE_NOT_EMPTY: {
             struct chunk_descriptor *cd = chunk->data;
-            if (!var_get_is_empty(cd->descriptor, variables)) {
+            bool empty = var_get_is_empty(cd->descriptor, variables);
+            if (chunk->flags & TPL_FLAG_NEGATE)
+                empty = !empty;
+            if (empty) {
+                chunk = cd->chunk;
+            } else {
                 chunk = lwan_tpl_apply_until(tpl,
-                                    (lwan_tpl_chunk_t *) chunk->list.next,
-                                    buf,
-                                    variables,
-                                    until_found_end_if,
-                                    cd->chunk);
-                break;
+                    (lwan_tpl_chunk_t *) chunk->list.next, buf, variables,
+                    until_found_end_if, cd->chunk);
             }
-
-            chunk = cd->chunk;
             break;
         }
         case TPL_ACTION_APPLY_TPL: {
@@ -743,15 +756,30 @@ lwan_tpl_apply_until(lwan_tpl_t *tpl,
             break;
         }
         case TPL_ACTION_LIST_START_ITER: {
-            assert(!coro);
+            if (UNLIKELY(coro != NULL)) {
+                lwan_status_warning("Coroutine is not NULL when starting iteration");
+                break;
+            }
 
             struct chunk_descriptor *cd = chunk->data;
             coro = coro_new(&switcher, cd->descriptor->generator, variables);
 
-            if (!coro_resume(coro)) {
+            bool resumed = coro_resume_value(coro, 0);
+            lwan_tpl_flag_t flags = chunk->flags;
+            if (flags & TPL_FLAG_NEGATE)
+                resumed = !resumed;
+            if (!resumed) {
                 chunk = cd->chunk;
+                if (flags & TPL_FLAG_NEGATE) {
+                    coro_resume_value(coro, 1);
+                    coro_free(coro);
+                    coro = NULL;
+                    continue;
+                }
+
                 coro_free(coro);
                 coro = NULL;
+
                 break;
             }
 
@@ -760,9 +788,13 @@ lwan_tpl_apply_until(lwan_tpl_t *tpl,
             continue;
         }
         case TPL_ACTION_LIST_END_ITER: {
-            assert(coro);
+            if (UNLIKELY(!coro)) {
+                if (!chunk->flags)
+                    lwan_status_warning("Coroutine is NULL when finishing iteration");
+                break;
+            }
 
-            if (!coro_resume(coro)) {
+            if (!coro_resume_value(coro, 0)) {
                 coro_free(coro);
                 coro = NULL;
                 break;
@@ -835,8 +867,7 @@ int main(int argc, char *argv[])
         return 1;
 
     printf("*** Applying template 100000 times...\n");
-    size_t i;
-    for (i = 0; i < 100000; i++) {
+    for (size_t i = 0; i < 100000; i++) {
         strbuf_t *applied = lwan_tpl_apply(tpl, (struct test_struct[]) {{
             .some_int = 42,
             .a_string = "some string"
