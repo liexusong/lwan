@@ -562,7 +562,7 @@ lwan_main_loop(lwan_t *l)
     lwan_status_info("Ready to serve");
 
     for (;;) {
-        int client_fd = accept4(l->main_socket, NULL, NULL, SOCK_NONBLOCK);
+        int client_fd = accept4(l->main_socket, NULL, NULL, SOCK_NONBLOCK); // 接收用户连接
         if (UNLIKELY(client_fd < 0)) {
             if (errno != EBADF) {
                 lwan_status_perror("accept");
@@ -578,6 +578,6 @@ lwan_main_loop(lwan_t *l)
             break;
         }
 
-        schedule_client(l, client_fd);
+        schedule_client(l, client_fd); // 进行用户调度
     }
 }
