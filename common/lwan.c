@@ -460,7 +460,7 @@ lwan_init(lwan_t *l)
     /* These will only print debugging messages. Debug messages are always
      * printed if we're on a debug build, so the quiet setting will be
      * respected. */
-    lwan_job_thread_init(); // 初始化任务线程
+    lwan_job_thread_init(); // 初始化任务工作线程
     lwan_response_init();
     lwan_tables_init();
 

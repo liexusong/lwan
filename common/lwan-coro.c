@@ -197,6 +197,12 @@ coro_reset(coro_t *coro, coro_function_t func, void *data)
 #endif
 }
 
+/**
+ * 创建一个新的协程上下文
+ * @param: switcher, 调度器
+ * @param: function, 协程的执行函数
+ * @param: data, function的参数
+ */
 ALWAYS_INLINE coro_t *
 coro_new(coro_switcher_t *switcher, coro_function_t function, void *data)
 {
@@ -206,7 +212,7 @@ coro_new(coro_switcher_t *switcher, coro_function_t function, void *data)
 
     coro->switcher = switcher;
     coro->defer = NULL;
-    coro_reset(coro, function, data);
+    coro_reset(coro, function, data); /* 初始化协程上下文 */
 
 #if !defined(NDEBUG) && defined(USE_VALGRIND)
     char *stack = (char *)(coro + 1);
@@ -222,6 +228,9 @@ coro_get_data(coro_t *coro)
     return LIKELY(coro) ? coro->data : NULL;
 }
 
+/*
+ * 恢复coro协程的执行上下文
+ */
 ALWAYS_INLINE int
 coro_resume(coro_t *coro)
 {
@@ -230,7 +239,7 @@ coro_resume(coro_t *coro)
 
 #if defined(__x86_64__) || defined(__i386__)
 
-    // 交换到新的执行上下文
+    // 把当前的执行上下文保存到caller中, 并交换到context的执行流
     coro_swapcontext(&coro->switcher->caller, &coro->context);
 
     if (!coro->ended) // 如果子协程还没有完成执行

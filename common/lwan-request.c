@@ -469,7 +469,7 @@ static lwan_http_status_t read_from_request_socket(lwan_request_t *request,
                     (size_t)(buffer_size - total_read));
         /* Client has shutdown orderly, nothing else to do; kill coro */
         if (UNLIKELY(n == 0)) {
-            coro_yield(request->conn->coro, CONN_CORO_ABORT);
+            coro_yield(request->conn->coro, CONN_CORO_ABORT); /* 让给其他客户端协程运行 */
             __builtin_unreachable();
         }
 
@@ -482,7 +482,7 @@ yield_and_read_again:
                  * "can read" state (and thus resumable). */
                 request->conn->flags ^= CONN_WRITE_EVENTS;
                 /* Yield 1 so the scheduler doesn't kill the coroutine. */
-                coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME);
+                coro_yield(request->conn->coro, CONN_CORO_MAY_RESUME); /* 让给其他客户端协程运行 */
                 /* Put the WRITE_EVENTS flag back on. */
                 request->conn->flags ^= CONN_WRITE_EVENTS;
                 /* We can probably read again, so try it */
@@ -494,7 +494,7 @@ yield_and_read_again:
                 return HTTP_BAD_REQUEST;
 
             /* Unexpected error, kill coro */
-            coro_yield(request->conn->coro, CONN_CORO_ABORT);
+            coro_yield(request->conn->coro, CONN_CORO_ABORT); /* 让给其他客户端协程运行 */
             __builtin_unreachable();
         }
 
@@ -695,7 +695,7 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
         }
     };
 
-    status = read_request(request, &helper);
+    status = read_request(request, &helper); /* 读取请求 */
     if (UNLIKELY(status != HTTP_OK)) {
         /* If status is anything but a bad request at this point, give up. */
         if (status != HTTP_BAD_REQUEST)
@@ -704,13 +704,13 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
         return;
     }
 
-    status = parse_http_request(request, &helper);
+    status = parse_http_request(request, &helper); /* 解析请求头 */
     if (UNLIKELY(status != HTTP_OK)) {
         lwan_default_response(request, status);
         return;
     }
 
-    url_map = lwan_trie_lookup_prefix(l->url_map_trie, request->url.value);
+    url_map = lwan_trie_lookup_prefix(l->url_map_trie, request->url.value); /* 根据url获取处理handle */
     if (UNLIKELY(!url_map)) {
         lwan_default_response(request, HTTP_NOT_FOUND);
         return;
@@ -725,7 +725,7 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
         return;
     }
 
-    status = url_map->handler(request, &request->response, url_map->data);
+    status = url_map->handler(request, &request->response, url_map->data); /* 处理请求 */
     lwan_response(request, status);
 }
 

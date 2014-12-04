@@ -72,7 +72,7 @@ struct lwan_tpl_chunk_t_ {
 };
 
 struct lwan_tpl_t_ {
-    struct list_head chunks;
+    struct list_head chunks; /* chunk list */
     size_t minimum_size;
 };
 
@@ -224,6 +224,7 @@ compile_append_text(struct parser_state *state, strbuf_t *buf)
     if (!length)
         return 0;
 
+    // 申请一个chunk
     lwan_tpl_chunk_t *chunk = malloc(sizeof(*chunk));
     if (!chunk)
         return -ENOMEM;
@@ -409,18 +410,18 @@ lwan_tpl_free(lwan_tpl_t *tpl)
         return STATE_PARSE_ERROR; \
     } while(0)
 
+/*
+ * 解析模板, 根据state状态来进行操作
+ */
 static int
 feed_into_compiler(struct parser_state *parser_state,
-    const lwan_var_descriptor_t *descriptor,
-    int state,
-    strbuf_t *buf,
-    int ch,
-    char *error_msg)
+    const lwan_var_descriptor_t *descriptor, int state,
+    strbuf_t *buf, int ch, char *error_msg)
 {
     bool last_pass = ch == EOF;
 
     switch (state) {
-    case STATE_DEFAULT:
+    case STATE_DEFAULT: // 初始化状态
         if (ch == '{')
             return STATE_FIRST_BRACE;
         if (last_pass)
@@ -429,7 +430,7 @@ feed_into_compiler(struct parser_state *parser_state,
         strbuf_append_char(buf, (char)ch);
         break;
 
-    case STATE_FIRST_BRACE:
+    case STATE_FIRST_BRACE: // 已经获得第一个左括号
         if (ch == '{') {
             state = STATE_SECOND_BRACE;
             goto append_text;
@@ -444,7 +445,7 @@ feed_into_compiler(struct parser_state *parser_state,
 
         return STATE_DEFAULT;
 
-    case STATE_SECOND_BRACE:
+    case STATE_SECOND_BRACE: // 获得第二个左括号
         if (ch == '{')
             PARSE_ERROR("Unexpected open brace");
         if (ch == '}')
@@ -578,6 +579,8 @@ lwan_tpl_compile_string(const char *string, const lwan_var_descriptor_t *descrip
 
     int line = 1;
     int column = 1;
+
+    /* 遍历字符串 */
     for (; *string; string++) {
         if (*string == '\n') {
             if (state == STATE_DEFAULT)

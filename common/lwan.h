@@ -192,14 +192,15 @@ struct lwan_request_t_ {
     lwan_response_t response;
 };
 
-// 模块对象
-// @name: 模块名称
-// @init: 初始化模块时调用
-// @init_from_hash: 添加到HashTable时被调用
-// @shutdown: 被注销时调用
-// @handle: 模块的处理回调
-// @flags: 模块的标志
-//
+/**
+ * 模块对象
+ * @name: 模块名称
+ * @init: 初始化模块时调用
+ * @init_from_hash: 添加到HashTable时被调用
+ * @shutdown: 被注销时调用
+ * @handle: 模块的处理回调
+ * @flags: 模块的标志
+ */
 struct lwan_module_t_ {
     const char *name;
     void *(*init)(void *args);
@@ -249,9 +250,9 @@ struct lwan_config_t_ {
 };
 
 struct lwan_t_ {
-    lwan_trie_t *url_map_trie;
-    lwan_connection_t *conns;
-    int main_socket;
+    lwan_trie_t *url_map_trie; /* 查找URL的trie树 */
+    lwan_connection_t *conns;  /* 用户连接列表 */
+    int main_socket;           /* listen的socket */
 
     lwan_config_t config;
 
@@ -259,9 +260,9 @@ struct lwan_t_ {
         short count;
         unsigned max_fd;
         lwan_thread_t *threads;
-    } thread;
+    } thread; /* 线程信息 */
 
-    struct hash *module_registry;
+    struct hash *module_registry; /* 模块表 */
 };
 
 void lwan_set_url_map(lwan_t *l, const lwan_url_map_t *map);

@@ -74,7 +74,7 @@ lwan_response_init(void)
 
     lwan_status_debug("Initializing default response");
 
-    error_template = lwan_tpl_compile_string(error_template_str, error_descriptor);
+    error_template = lwan_tpl_compile_string(error_template_str, error_descriptor); /* 编译模板 */
     if (UNLIKELY(!error_template))
         lwan_status_critical_perror("lwan_tpl_compile_string");
 }

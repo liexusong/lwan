@@ -130,6 +130,9 @@ min(const int a, const int b)
     return a < b ? a : b;
 }
 
+/*
+ * 客户端连接的协程处理函数
+ */
 static int
 process_request_coro(coro_t *coro)
 {
@@ -151,7 +154,7 @@ process_request_coro(coro_t *coro)
     strbuf_init(strbuf);
     coro_defer(coro, CORO_DEFER(strbuf_free), strbuf);
 
-    lwan_process_request(conn->thread->lwan, &request);
+    lwan_process_request(conn->thread->lwan, &request); /* 处理请求 */
 
     return CONN_CORO_FINISHED;
 }
@@ -165,7 +168,7 @@ resume_coro_if_needed(struct death_queue_t *dq, lwan_connection_t *conn,
     if (!(conn->flags & CONN_SHOULD_RESUME_CORO))
         return;
 
-    lwan_connection_coro_yield_t yield_result = coro_resume(conn->coro);
+    lwan_connection_coro_yield_t yield_result = coro_resume(conn->coro); // 恢复当前连接的执行上下文
     /* CONN_CORO_ABORT is -1, but comparing with 0 is cheaper */
     if (yield_result < CONN_CORO_MAY_RESUME) {
         destroy_coro(dq, conn);
@@ -237,6 +240,9 @@ update_date_cache(lwan_thread_t *thread)
     }
 }
 
+/*
+ * 创建协程对象
+ */
 static ALWAYS_INLINE void
 spawn_or_reset_coro_if_needed(lwan_connection_t *conn,
             coro_switcher_t *switcher, struct death_queue_t *dq)
@@ -275,6 +281,9 @@ grab_and_watch_client(lwan_thread_t *t, lwan_connection_t *conns)
     return &conns[fd];
 }
 
+/*
+ * worker线程的主流程函数
+ */
 static void *
 thread_io_loop(void *data)
 {
@@ -314,7 +323,7 @@ thread_io_loop(void *data)
             for (struct epoll_event *ep_event = events; n_fds--; ep_event++) {
                 lwan_connection_t *conn;
 
-                if (!ep_event->data.ptr) {
+                if (!ep_event->data.ptr) { // 通知信号
                     conn = grab_and_watch_client(t, conns);
                     if (UNLIKELY(!conn))
                         continue;
@@ -341,6 +350,11 @@ epoll_fd_closed:
     return NULL;
 }
 
+/*
+ * 创建worker线程, 每个worker线程拥有一个epoll,
+ * worker线程的主流程函数为: thread_io_loop(),
+ * thread_io_loop()主要处理客户端连接.
+ */
 static void
 create_thread(lwan_t *l, short thread_n)
 {

@@ -41,6 +41,9 @@ static pthread_mutex_t queue_mutex;
 static bool running = false;
 static struct list_head jobs;
 
+/*
+ * 工作线程的主流程
+ */
 static void*
 job_thread(void *data __attribute__((unused)))
 {
@@ -51,7 +54,7 @@ job_thread(void *data __attribute__((unused)))
         bool had_job = false;
 
         pthread_mutex_lock(&queue_mutex);
-        list_for_each(&jobs, job, jobs)
+        list_for_each(&jobs, job, jobs) /* 遍历所以工作, 调用他们的回调函数 */
             had_job |= job->cb(job->data);
         pthread_mutex_unlock(&queue_mutex);
 
@@ -69,16 +72,19 @@ job_thread(void *data __attribute__((unused)))
     return NULL;
 }
 
+/*
+ * 初始化工作线程
+ */
 void lwan_job_thread_init(void)
 {
     assert(!running);
 
     lwan_status_debug("Initializing low priority job thread");
 
-    list_head_init(&jobs);
+    list_head_init(&jobs); /* 工作线程列表 */
 
     running = true;
-    if (pthread_create(&self, NULL, job_thread, NULL) < 0)
+    if (pthread_create(&self, NULL, job_thread, NULL) < 0) /* 创建线程, 线程的执行函数为job_thread() */
         lwan_status_critical_perror("pthread_create");
 
 #ifdef SCHED_IDLE
@@ -106,6 +112,9 @@ void lwan_job_thread_shutdown(void)
     pthread_mutex_unlock(&queue_mutex);
 }
 
+/*
+ * 添加一个任务工作
+ */
 void lwan_job_add(bool (*cb)(void *data), void *data)
 {
     assert(cb);
@@ -124,6 +133,9 @@ void lwan_job_add(bool (*cb)(void *data), void *data)
     pthread_mutex_unlock(&queue_mutex);
 }
 
+/*
+ * 删除一个任务工作
+ */
 void lwan_job_del(bool (*cb)(void *data), void *data)
 {
     struct job_t *node, *next;
